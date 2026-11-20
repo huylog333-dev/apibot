@@ -20,8 +20,6 @@ import sqlite3
 import string
 import time
 import unicodedata
-import urllib.request
-from urllib.parse import quote
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -139,7 +137,7 @@ def apply_cfg(remote=None):
     BANK_ACCOUNT, BANK_OWNER = str(pick("bank_account")), str(pick("bank_owner"))
     MIN_DEPOSIT = num("min_deposit", 1000, 10000)
     MAX_DEPOSIT = max(num("max_deposit", 1000, 50000000), MIN_DEPOSIT)
-    USE_DYNAMIC_QR = True  # luôn dùng QR động (tự điền số tiền + nội dung CK); qr.jpg tĩnh chỉ là phương án dự phòng
+    USE_DYNAMIC_QR = bool(pick("use_dynamic_qr"))
     FEEDBACK_CHAT = _chat_val(pick("feedback_chat"))
     FEEDBACK_THREAD_ID = (_ints(str(pick("feedback_thread"))) or [None])[0]  # chỉ cần nếu box bật Topics
     FEEDBACK_MASK_NAME = bool(pick("feedback_mask"))  # True = ẩn tên khách: D***
@@ -238,11 +236,6 @@ _ensure_cols(
      "handled_by": "INTEGER", "handled_at": "INTEGER"},
 )
 
-
-db.execute(
-    "CREATE TABLE IF NOT EXISTS order_msgs(order_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, msg_id INTEGER NOT NULL)"
-)
-db.execute("CREATE INDEX IF NOT EXISTS idx_order_msgs ON order_msgs(order_id)")
 
 _ensure_cols(
     "orders",
@@ -768,92 +761,6 @@ def purchase_box_text(name, gname, label):
 # ============================== GIAO DIỆN ==============================
 
 
-_OWNED = {}  # uid -> (ts, {game_code: [ {key,pkg,days,from_use,link,exp,left,activated,at} ]}) — key CÒN HẠN của khách
-
-
-async def fetch_owned(uid, force=False):
-    """Key còn hạn của khách theo game (hỏi sunviw hạn thật của từng key). None = chưa kiểm tra được."""
-    now = time.time()
-    c = _OWNED.get(uid)
-    if c and not force and now - c[0] < 20:
-        return c[1]
-    rows = db.execute(
-        "SELECT game,pkg_code,days,from_use,key_text,link,done FROM purchases "
-        "WHERE user_id=? AND status='done' AND key_text IS NOT NULL AND key_text!='' ORDER BY id DESC LIMIT 200",
-        (uid,),
-    ).fetchall()
-    if not rows:
-        _OWNED[uid] = (now, {})
-        return {}
-    keys = list(dict.fromkeys(r["key_text"] for r in rows))
-    try:
-        res = await api.call("keystat", {"tg": uid, "keys": keys})
-    except Exception as e:  # noqa: BLE001  (ApiDown, sunviw cũ chưa có op keystat...)
-        log.warning("Không lấy được hạn key của khách %s: %s", uid, e)
-        return c[1] if c else None
-    if not isinstance(res, dict) or not res.get("ok"):
-        log.warning("keystat lỗi: %s", (res or {}).get("code") if isinstance(res, dict) else res)
-        return c[1] if c else None
-    st = res.get("keys") or {}
-    out = {}
-    for r in rows:
-        s_ = st.get(r["key_text"]) or {}
-        if not s_.get("exists") or s_.get("expired"):
-            continue  # key hết hạn / đã bị xóa -> không hiện
-        out.setdefault(r["game"], []).append(
-            {"key": r["key_text"], "pkg": r["pkg_code"], "days": r["days"], "link": (r["link"] or "").strip(),
-             "exp": s_.get("exp"), "left": int(s_.get("left") or 0), "activated": bool(s_.get("activated")), "at": r["done"]}
-        )
-    _OWNED[uid] = (now, out)
-    return out
-
-
-def left_text(sec):
-    d, rem = divmod(int(sec), 86400)
-    h, m = divmod(rem // 60, 60)
-    if d:
-        return f"{d} ngày {h} giờ"
-    return f"{h} giờ {m} phút" if h else f"{m} phút"
-
-
-def owned_screen(owned):
-    """Danh sách game khách đang có key còn hạn."""
-    if not owned:
-        return "🔑 <b>GAME ĐÃ MUA KEY</b>\n" + LINE + "\nBạn chưa có key nào còn hạn.", back_home_kb()
-    names = {g["code"]: g["name"] for g in games_all()}
-    rows = []
-    for code, lst in owned.items():
-        rows.append([B(f"🎮 {names.get(code, code)} ({len(lst)})", callback_data=f"own:{code}")])
-    text = (
-        f"🔑 <b>GAME ĐÃ MUA KEY</b>\n{LINE}\n"
-        f"Bạn đang có key còn hạn ở <b>{len(owned)}</b> game.\nChọn game để xem key 👇"
-    )
-    return text, back_home_kb(rows)
-
-
-def owned_game_screen(code, lst):
-    gm = db.execute("SELECT name FROM games WHERE code=?", (code,)).fetchone()
-    gname = gm["name"] if gm else code
-    link = game_link(code) or next((x["link"] for x in lst if x["link"]), "")
-    parts = [f"🎮 <b>{esc(gname)}</b>\n{LINE}"]
-    for x in lst[:8]:
-        if x["activated"] and x["exp"]:
-            hsd = f"📅 HSD: <b>{fmt_time(x['exp'])}/{datetime.fromtimestamp(x['exp'], VN).year}</b> · còn <b>{left_text(x['left'])}</b>"
-        else:
-            hsd = f"📅 HSD: <b>{x['days']} ngày</b> — chưa kích hoạt, tính từ lần dùng đầu tiên"
-        parts.append(f"⏱ Gói: <b>{pkg_label(x['pkg'])}</b>\n🔑 <code>{esc(x['key'])}</code>\n{hsd}")
-    if len(lst) > 8:
-        parts.append(f"<i>... và {len(lst) - 8} key khác.</i>")
-    if link:
-        parts.append(f"🔗 Link game:\n{esc(link)}")
-    text = "\n\n".join(parts)
-    rows = []
-    if link and re.fullmatch(r"https?://\S+", link):
-        rows.append([B("🎮 Mở game", url=link)])
-    rows.append([B("⬅️ Trở về", callback_data="own")])
-    return text, back_home_kb(rows)
-
-
 def home_screen(u):
     g = db.execute("SELECT COUNT(*) n, SUM(CASE WHEN sell=1 AND online=1 THEN 1 ELSE 0 END) o FROM games WHERE api=1 AND sell=1").fetchone()
     g_on = len(games_online())  # mất liên lạc sunviw -> 0 game online
@@ -881,13 +788,11 @@ def home_screen(u):
         f"{LINE}\n"
         f"{note}"
     )
-    rows = [[B("🛒 Mua Key", callback_data="buy"), B("💰 Nạp Tiền", callback_data="dep")]]
-    oc = _OWNED.get(u["id"])
-    if oc and oc[1]:  # có ít nhất 1 game còn key; 0/6 -> nút tự ẩn
-        rows.append([B("🔑 Game Đã Mua Key", callback_data="own")])
-    rows.append([B("💬 Feedback", callback_data="fb"), B("📜 Lịch Sử Số Dư", callback_data="hist")])
-    url = cskh_url()
-    rows.append([B("🎧 CSKH", url=url)] if url else [B("🎧 CSKH", callback_data="cskh_none")])
+    # Khách thường chỉ có 4 mục: Mua Key / Nạp Tiền / Feedback / Lịch sử biến động số dư.
+    rows = [
+        [B("🛒 Mua Key", callback_data="buy"), B("💰 Nạp Tiền", callback_data="dep")],
+        [B("💬 Feedback", callback_data="fb"), B("📜 Lịch Sử Số Dư", callback_data="hist")],
+    ]
     if adm:
         rows.append([B("🛠 Bảng Admin", callback_data="adm")])
     return text, K(rows)
@@ -1206,53 +1111,7 @@ async def notify_admins(bot, text, kb=None, perm="deposit"):
     return sent
 
 
-async def notify_admins_order(bot, o):
-    """Gửi đơn nạp cho mọi admin có quyền duyệt + nhớ id tin nhắn để xóa khi đơn được xử lý."""
-    sent = 0
-    for aid in admins_with("deposit"):
-        try:
-            m = await bot.send_message(aid, order_card(o), reply_markup=order_kb(o["id"]))
-            db.execute("INSERT INTO order_msgs(order_id,chat_id,msg_id) VALUES(?,?,?)", (o["id"], aid, m.message_id))
-            sent += 1
-        except TelegramError as e:
-            log.warning("Không gửi được cho admin %s: %s", aid, e)
-    return sent
-
-
-async def clear_order_msgs(bot, oid):
-    """Xóa tin nhắn đơn nạp ở TẤT CẢ admin (đơn đã duyệt / từ chối)."""
-    rows = db.execute("SELECT chat_id,msg_id FROM order_msgs WHERE order_id=?", (oid,)).fetchall()
-    db.execute("DELETE FROM order_msgs WHERE order_id=?", (oid,))
-    for r in rows:
-        await delete_by_id(bot, r["chat_id"], r["msg_id"])
-
-
 # ============================== NẠP TIỀN ==============================
-
-
-def qr_dynamic_url(amount, code):
-    return (
-        f"https://img.vietqr.io/image/{quote(BANK_CODE)}-{quote(BANK_ACCOUNT)}-compact2.png"
-        f"?amount={int(amount)}&addInfo={quote(code)}&accountName={quote(BANK_OWNER)}"
-    )
-
-
-async def fetch_qr_bytes(url):
-    """Tải ảnh QR về rồi gửi dạng file (Telegram tự tải URL hay lỗi / cache). Lỗi -> None."""
-
-    def _get():
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as r:
-            data = r.read()
-            if r.status == 200 and str(r.headers.get("Content-Type", "")).startswith("image") and len(data) > 500:
-                return data
-        return None
-
-    try:
-        return await asyncio.to_thread(_get)
-    except Exception as e:  # noqa: BLE001
-        log.warning("Tải QR động lỗi: %s", e)
-        return None
 
 
 async def open_qr(bot, chat_id, uid, amount, gift=None):
@@ -1289,23 +1148,22 @@ async def open_qr(bot, chat_id, uid, amount, gift=None):
         bonus_txt += f"➡️ Tổng bạn nhận: <b>{money(amount + bonus)}</b>\n"
     if g:
         bonus_txt += f"<i>⏱ Gifcode được giữ {GIFT_HOLD // 60} phút — hãy chuyển khoản &amp; bấm xác nhận trong thời gian này.</i>\n"
-    def make_cap(dyn):
-        return (
-            f"💳 <b>NẠP TIỀN — ĐƠN #{oid}</b>\n{LINE}\n"
-            f"🏦 Ngân hàng: <b>{esc(BANK_NAME)}</b>\n"
-            f"👤 Chủ TK: <b>{esc(BANK_OWNER)}</b>\n"
-            f"🔢 STK: <code>{esc(BANK_ACCOUNT)}</code>\n"
-            f"💵 Số tiền: <b>{money(amount)}</b>\n"
-            f"{bonus_txt}"
-            f"📝 Nội dung CK: <code>{code}</code>\n{LINE}\n"
-            + (
-                "📲 Quét mã QR — <b>số tiền &amp; nội dung đã tự điền sẵn</b>, chuyển xong bấm <b>Tôi đã chuyển khoản</b>."
-                if dyn
-                else "📲 Quét mã QR, nhập <b>đúng số tiền</b> &amp; <b>nội dung CK</b> như trên, "
-                "chuyển xong bấm <b>Tôi đã chuyển khoản</b>."
-            )
+    dyn = USE_DYNAMIC_QR
+    cap = (
+        f"💳 <b>NẠP TIỀN — ĐƠN #{oid}</b>\n{LINE}\n"
+        f"🏦 Ngân hàng: <b>{esc(BANK_NAME)}</b>\n"
+        f"👤 Chủ TK: <b>{esc(BANK_OWNER)}</b>\n"
+        f"🔢 STK: <code>{esc(BANK_ACCOUNT)}</code>\n"
+        f"💵 Số tiền: <b>{money(amount)}</b>\n"
+        f"{bonus_txt}"
+        f"📝 Nội dung CK: <code>{code}</code>\n{LINE}\n"
+        + (
+            "📲 Quét mã QR, chuyển khoản xong bấm <b>Tôi đã chuyển khoản</b>."
+            if dyn
+            else "📲 Quét mã QR, nhập <b>đúng số tiền</b> &amp; <b>nội dung CK</b> như trên, "
+            "chuyển xong bấm <b>Tôi đã chuyển khoản</b>."
         )
-
+    )
     kb = K(
         [
             [B("✅ Tôi đã chuyển khoản", callback_data=f"paid:{oid}")],
@@ -1314,16 +1172,15 @@ async def open_qr(bot, chat_id, uid, amount, gift=None):
     )
 
     msg = None
-    url = qr_dynamic_url(amount, code)
-    img = await fetch_qr_bytes(url)
-    try:
-        if img:
-            msg = await bot.send_photo(chat_id, img, caption=make_cap(True), reply_markup=kb)
-        else:
-            msg = await bot.send_photo(chat_id, url, caption=make_cap(True), reply_markup=kb)
-    except TelegramError as e:
-        log.warning("Gửi QR động lỗi, dùng QR tĩnh: %s", e)
-    cap = make_cap(False)  # từ đây là QR tĩnh / không QR -> khách phải nhập tay
+    if dyn:
+        url = (
+            f"https://img.vietqr.io/image/{BANK_CODE}-{BANK_ACCOUNT}-compact2.png"
+            f"?amount={amount}&addInfo={code}&accountName={BANK_OWNER.replace(' ', '%20')}"
+        )
+        try:
+            msg = await bot.send_photo(chat_id, url, caption=cap, reply_markup=kb)
+        except TelegramError as e:
+            log.warning("QR động lỗi, dùng QR tĩnh: %s", e)
     if msg is None and os.path.exists(QR_FILE):
         try:
             with open(QR_FILE, "rb") as f:
@@ -1747,24 +1604,7 @@ async def route(q, ctx, data):
     ctx.user_data.pop("await", None)
 
     if data == "home":
-        await fetch_owned(uid)  # cập nhật nút "Game Đã Mua Key" (ẩn nếu không còn key nào còn hạn)
         await show(q, ctx, *home_screen(user))
-        return
-    if data == "own" or data.startswith("own:"):
-        owned = await fetch_owned(uid, force=True)
-        if owned is None:
-            return "⚠️ Chưa kiểm tra được hạn key lúc này, vui lòng thử lại sau ít phút."
-        if data == "own":
-            if not owned:  # hết key -> về home (nút tự ẩn)
-                await show(q, ctx, *home_screen(user))
-                return "Bạn chưa có key nào còn hạn."
-            await show(q, ctx, *owned_screen(owned))
-            return
-        lst = owned.get(data[4:])
-        if not lst:
-            await show(q, ctx, *(owned_screen(owned) if owned else home_screen(user)))
-            return "Game này không còn key còn hạn."
-        await show(q, ctx, *owned_game_screen(data[4:], lst))
         return
     if data == "cskh_none":
         return "Chưa cấu hình CSKH. Admin chính điền ở panel sunviw (tab Bot Tele) hoặc CSKH_USERNAME trong config.env"
@@ -1828,7 +1668,7 @@ async def route(q, ctx, data):
         )
         db.execute("UPDATE orders SET msg_id=? WHERE id=?", (wait.message_id, oid))
         o = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
-        sent = await notify_admins_order(ctx.bot, o)
+        sent = await notify_admins(ctx.bot, order_card(o), order_kb(oid))
         if not sent:
             log.warning("Đơn #%s đang chờ nhưng chưa có admin nhận (chưa cấu hình ADMIN_CHAT_IDS).", oid)
         return
@@ -1840,10 +1680,12 @@ async def route(q, ctx, data):
         approve = data.startswith("ad:ok:")
         o = decide_order(int(data.split(":")[2]), approve, uid)
         if not o:
-            await safe_delete(q.message)  # đơn đã có admin khác xử lý -> dọn tin này cho đỡ nhầm
             return "Đơn này đã được xử lý hoặc không còn hiệu lực."
-        await clear_order_msgs(ctx.bot, o["id"])  # xóa tin đơn ở TẤT CẢ admin
-        await safe_delete(q.message)  # (tin từ /pending không nằm trong bảng order_msgs)
+        stamp = ("✅ <b>ĐÃ DUYỆT</b>" if approve else "❌ <b>ĐÃ TỪ CHỐI</b>") + f" bởi {esc(q.from_user.full_name)} · {fmt_time(time.time())}"
+        try:
+            await q.edit_message_text(f"{q.message.text_html}\n\n{stamp}", reply_markup=None)
+        except TelegramError:
+            pass
         await notify_user_order(ctx.bot, o)
         if approve:  # đăng lên box: tên che bớt + số tiền thực nhận
             buyer = reload_user(o["user_id"])
@@ -1928,7 +1770,6 @@ async def route(q, ctx, data):
         db.execute(
             "UPDATE feedback SET status='canceled' WHERE id=? AND user_id=? AND status='draft'", (int(data[5:]), uid)
         )
-        await fetch_owned(uid, force=True)
         await show(q, ctx, *home_screen(user))  # xóa tin xác nhận, về trang chủ
         return
 
@@ -3054,7 +2895,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     u = get_user(update.effective_user)
     await safe_delete(update.message)
-    await fetch_owned(u["id"])
     text, kb = home_screen(u)
     await ctx.bot.send_message(update.effective_chat.id, text, reply_markup=kb)
 
@@ -3210,8 +3050,7 @@ async def send_pending(bot, chat_id, uid):
         await bot.send_message(chat_id, "✅ Không có đơn nạp / feedback nào đang chờ.")
         return
     for o in rows:
-        m = await bot.send_message(chat_id, order_card(o), reply_markup=order_kb(o["id"]))
-        db.execute("INSERT INTO order_msgs(order_id,chat_id,msg_id) VALUES(?,?,?)", (o["id"], chat_id, m.message_id))
+        await bot.send_message(chat_id, order_card(o), reply_markup=order_kb(o["id"]))
     for fb in fbs:
         await bot.send_photo(chat_id, fb["photo_id"], caption=fb_card(fb), reply_markup=fb_kb(fb["id"]))
 
