@@ -11,6 +11,7 @@ KEY được SINH BỞI TOOL SUNVIW (cùng hệ key với panel) qua API ẩn + 
 import asyncio
 import hashlib
 import html
+import json
 import logging
 import os
 import random
@@ -28,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton as B
 from telegram import InlineKeyboardMarkup as K
-from telegram import Update
+from telegram import InputMediaPhoto, Update
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, ChatMigrated, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
@@ -95,6 +96,8 @@ QR_FILE = os.path.join(BASE, os.getenv("QR_FILE", "qr.jpg"))
 # QR_URL_TEMPLATE=https://vietqr.app/img?acc={acc}&bank={bank}&amount={amount}&des={des}&holder={holder}
 QR_URL_TEMPLATE = os.getenv("QR_URL_TEMPLATE", "").strip()
 FB_MAX = 600  # độ dài tối đa nội dung feedback
+FB_PHOTOS_MAX = 10  # số ảnh tối đa mỗi feedback (Telegram cho tối đa 10 ảnh / album)
+FB_ALBUM_WAIT = 1.5  # giây đợi các ảnh của cùng 1 lần gửi (album) về đủ rồi mới xử lý
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE, "shop.db"))
 
 # Các biến dưới đây do apply_cfg() điền (config.env + panel):
@@ -264,6 +267,7 @@ _ensure_cols(
     },
 )
 _ensure_cols("feedback", {"game": "TEXT"})  # game khách chọn khi gửi feedback
+_ensure_cols("feedback", {"photos": "TEXT", "album": "TEXT"})  # photos = JSON list file_id (nhiều ảnh); album = JSON list message_id album ở chat khách (để xóa)
 _ensure_cols("users", {"blocked": "INTEGER NOT NULL DEFAULT 0"})  # khách đã chặn bot -> broadcast bỏ qua
 
 
@@ -1044,14 +1048,15 @@ def build_prompts():
             ),
             "fb_photo": (
                 f"💬 <b>GỬI FEEDBACK</b>\n{LINE}\n"
-                f"📸 Gửi <b>1 ảnh</b> kèm nội dung feedback vào đây (gửi ảnh thường hoặc gửi dạng <b>file</b> .jpg/.png đều được).\n"
-                f"✍️ Viết nội dung ở phần <b>chú thích</b> của ảnh (tối đa {FB_MAX} ký tự).\n\n"
+                f"📸 Gửi tối đa <b>{FB_PHOTOS_MAX} ảnh</b> (chọn nhiều ảnh cùng lúc hoặc gửi từng ảnh; ảnh thường hay <b>file</b> .jpg/.png đều được).\n"
+                f"✍️ Viết nội dung ở phần <b>chú thích</b> của ảnh (tối đa {FB_MAX} ký tự), hoặc gửi ảnh xong rồi gõ nội dung.\n\n"
                 f"<i>Ví dụ: ảnh key dùng được + “Key ngon, hỗ trợ nhiệt tình!”</i>"
             ),
             "fb_text": (
                 f"💬 <b>GỬI FEEDBACK</b>\n{LINE}\n"
-                f"✅ Đã nhận ảnh của bạn.\n"
-                f"✍️ Giờ gõ <b>nội dung feedback</b> rồi gửi vào đây (tối đa {FB_MAX} ký tự)."
+                f"✅ Đã nhận <b>{{n}}</b> ảnh (tối đa {FB_PHOTOS_MAX}).\n"
+                f"📸 Muốn thêm ảnh thì cứ gửi tiếp.\n"
+                f"✍️ Xong thì gõ <b>nội dung feedback</b> rồi gửi vào đây (tối đa {FB_MAX} ký tự)."
             ),
             "bc": (
                 f"📢 <b>THÔNG BÁO TOÀN BOT</b>\n{LINE}\n"
@@ -1671,7 +1676,7 @@ def gift_blocked(uid):
 
 def prompt_of(st):
     """Lời nhắc nhập liệu; feedback thì kèm tên game khách đã chọn."""
-    t = PROMPTS[st["type"]]
+    t = PROMPTS[st["type"]].replace("{n}", str(len(st.get("photos") or [])))
     if st["type"] in ("fb_photo", "fb_text") and st.get("game"):
         gm = db.execute("SELECT name FROM games WHERE code=?", (st["game"],)).fetchone()
         if gm:
@@ -2004,6 +2009,7 @@ async def route(q, ctx, data):
         _last_fb[uid] = time.time()
         chat_id = q.message.chat_id
         await safe_delete(q.message)  # xóa tin xác nhận
+        await delete_fb_album(ctx.bot, chat_id, fb)  # xóa album xem trước (nếu nhiều ảnh)
         wait = await ctx.bot.send_message(
             chat_id,
             f"⏳ <b>Vui lòng đợi trong giây lát...</b>\n{LINE}\n"
@@ -2011,11 +2017,14 @@ async def route(q, ctx, data):
         )
         db.execute("UPDATE feedback SET msg_id=? WHERE id=?", (wait.message_id, fid))
         fb = db.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone()
-        sent = await notify_admins_photo(ctx.bot, fb["photo_id"], fb_card(fb), fb_kb(fid))
+        sent = await notify_admins_photo(ctx.bot, fb, fb_card(fb), fb_kb(fid))
         if not sent:
             log.warning("Feedback #%s đang chờ nhưng chưa có admin nhận (chưa cấu hình ADMIN_CHAT_IDS).", fid)
         return
     if data.startswith("fbno:"):
+        old = db.execute("SELECT * FROM feedback WHERE id=? AND user_id=?", (int(data[5:]), uid)).fetchone()
+        if old:
+            await delete_fb_album(ctx.bot, q.message.chat_id, old)
         db.execute(
             "UPDATE feedback SET status='canceled' WHERE id=? AND user_id=? AND status='draft'", (int(data[5:]), uid)
         )
@@ -2064,7 +2073,10 @@ async def route(q, ctx, data):
         )
         stamp = ("✅ <b>ĐÃ DUYỆT &amp; ĐĂNG LÊN BOX</b>" if approve else "❌ <b>ĐÃ TỪ CHỐI</b>") + f" bởi {esc(q.from_user.full_name)} · {fmt_time(time.time())}"
         try:
-            await q.edit_message_caption(caption=f"{q.message.caption_html}\n\n{stamp}", reply_markup=None)
+            if q.message.photo:  # feedback 1 ảnh: thẻ là chú thích của ảnh
+                await q.edit_message_caption(caption=f"{q.message.caption_html}\n\n{stamp}", reply_markup=None)
+            else:  # nhiều ảnh: thẻ là tin chữ nằm dưới album
+                await q.edit_message_text(f"{q.message.text_html}\n\n{stamp}", reply_markup=None)
         except TelegramError:
             pass
         await notify_user_feedback(ctx.bot, db.execute("SELECT * FROM feedback WHERE id=?", (fid,)).fetchone())
@@ -2208,7 +2220,7 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif st["type"] == "fb_text":
         if not text:
             return await err("⚠️ Hãy gõ nội dung feedback bằng chữ.")
-        await fb_preview(ctx, user, chat, mid, st["photo"], text, st.get("doc", False), st.get("game"))
+        await fb_preview(ctx, user, chat, mid, st.get("photos") or [], text, st.get("game"))
 
 
 # ============================== FEEDBACK (ảnh + nội dung -> admin duyệt -> đăng lên box) ==============================
@@ -2224,42 +2236,92 @@ def fb_clip(text):
     return text if len(text) <= FB_MAX else text[: FB_MAX - 1] + "…"
 
 
-async def fb_preview(ctx, user, chat, prompt_mid, photo_id, text, is_doc=False, game=None):
+async def fb_preview(ctx, user, chat, prompt_mid, photos, text, game=None):
     """Gửi tin XÁC NHẬN (ảnh + nội dung + nút Xác nhận / Hủy), thay thế tin nhắc nhập.
-    is_doc=True: khách gửi ảnh dạng FILE (document) -> tải về rồi gửi lại thành ẢNH thường,
-    nhờ đó admin và box xem trực tiếp, các bước sau (send_photo) không cần đổi."""
+    photos = [{"id": file_id, "doc": True/False}, ...]. 1 ảnh: ảnh + chú thích + nút như cũ.
+    Nhiều ảnh: gửi album trước, rồi 1 tin chữ (nội dung + nút) ngay dưới album (album Telegram không gắn được nút).
+    Ảnh gửi dạng FILE (doc=True) được tải về rồi gửi lại thành ẢNH thường, các bước sau chỉ dùng file_id ảnh."""
     text = fb_clip(text)
+    photos = photos[:FB_PHOTOS_MAX]
+    if not photos:
+        await ctx.bot.send_message(chat, "⚠️ Chưa có ảnh nào, vui lòng gửi lại.", reply_markup=back_home_kb())
+        return
     ctx.user_data.pop("await", None)
     with tx() as c:
         c.execute("UPDATE feedback SET status='canceled' WHERE user_id=? AND status='draft'", (user["id"],))
         fid = c.execute(
-            "INSERT INTO feedback(user_id,text,at,photo_id,status,game) VALUES(?,?,?,?,?,?)",
-            (user["id"], text, int(time.time()), photo_id, "draft", game),
+            "INSERT INTO feedback(user_id,text,at,photo_id,photos,status,game) VALUES(?,?,?,?,?,?,?)",
+            (user["id"], text, int(time.time()), photos[0]["id"], json.dumps([p["id"] for p in photos]), "draft", game),
         ).lastrowid
     gm = db.execute("SELECT name FROM games WHERE code=?", (game,)).fetchone() if game else None
     cap = (
         f"📝 <b>XÁC NHẬN FEEDBACK</b>\n{LINE}\n"
         + (f"🎮 Game: <b>{esc(gm['name'])}</b>\n" if gm else "")
+        + (f"🖼 Số ảnh: <b>{len(photos)}</b>\n" if len(photos) > 1 else "")
         + f"{esc(text)}\n{LINE}\n"
         f"ℹ️ Feedback sẽ được gửi cho admin duyệt. Nếu được duyệt sẽ <b>đăng công khai lên box</b>.\n"
         f"Bấm <b>Xác nhận gửi</b> để gửi, hoặc <b>Hủy</b> để bỏ."
     )
     kb = K([[B("✅ Xác nhận gửi", callback_data=f"fbok:{fid}"), B("❌ Hủy", callback_data=f"fbno:{fid}")]])
     await delete_by_id(ctx.bot, chat, prompt_mid)
+    album_msgs = []
     try:
-        media = photo_id
-        if is_doc:
-            f = await ctx.bot.get_file(photo_id)
-            media = bytes(await f.download_as_bytearray())
-        msg = await ctx.bot.send_photo(chat, media, caption=cap, reply_markup=kb)
-        if is_doc:  # lưu file_id của bản ảnh để admin / box dùng
-            db.execute("UPDATE feedback SET photo_id=? WHERE id=?", (msg.photo[-1].file_id, fid))
+        media = []
+        for ph in photos:
+            if ph.get("doc"):
+                f = await ctx.bot.get_file(ph["id"])
+                media.append(bytes(await f.download_as_bytearray()))
+            else:
+                media.append(ph["id"])
+        if len(media) == 1:
+            msg = await ctx.bot.send_photo(chat, media[0], caption=cap, reply_markup=kb)
+            ids, album = [msg.photo[-1].file_id], []
+        else:
+            album_msgs = list(await ctx.bot.send_media_group(chat, [InputMediaPhoto(m) for m in media]))
+            ids = [m.photo[-1].file_id for m in album_msgs]
+            album = [m.message_id for m in album_msgs]
+            msg = await ctx.bot.send_message(chat, cap, reply_markup=kb)
+        db.execute(
+            "UPDATE feedback SET photo_id=?, photos=?, album=? WHERE id=?",
+            (ids[0], json.dumps(ids), json.dumps(album), fid),
+        )
     except TelegramError as e:
         log.warning("Không gửi được ảnh xác nhận feedback: %s", e)
         db.execute("UPDATE feedback SET status='canceled' WHERE id=?", (fid,))
+        for m in album_msgs:
+            await delete_by_id(ctx.bot, chat, m.message_id)
         await ctx.bot.send_message(chat, "⚠️ Không xử lý được ảnh, vui lòng thử gửi lại.", reply_markup=back_home_kb())
         return
     db.execute("UPDATE feedback SET msg_id=? WHERE id=?", (msg.message_id, fid))
+
+
+def fb_photo_ids(fb):
+    """Danh sách file_id ảnh của 1 feedback (feedback cũ chỉ có photo_id -> 1 ảnh)."""
+    try:
+        ids = json.loads(fb["photos"] or "[]")
+    except (ValueError, TypeError):
+        ids = []
+    ids = [i for i in ids if isinstance(i, str) and i]
+    return ids or ([fb["photo_id"]] if fb["photo_id"] else [])
+
+
+async def delete_fb_album(bot, chat, fb):
+    """Xóa album xem trước (nhiều ảnh) ở chat khách."""
+    try:
+        mids = json.loads(fb["album"] or "[]")
+    except (ValueError, TypeError):
+        mids = []
+    for m in mids:
+        await delete_by_id(bot, chat, m)
+
+
+async def send_fb_media(bot, chat_id, fb, caption, kb=None):
+    """Gửi ảnh feedback cho admin. 1 ảnh: ảnh + chú thích + nút. Nhiều ảnh: album rồi tin chữ (nội dung + nút)."""
+    ids = fb_photo_ids(fb)
+    if len(ids) <= 1:
+        return await bot.send_photo(chat_id, ids[0], caption=caption, reply_markup=kb)
+    await bot.send_media_group(chat_id, [InputMediaPhoto(i) for i in ids[:FB_PHOTOS_MAX]])
+    return await bot.send_message(chat_id, caption, reply_markup=kb)
 
 
 FB_IMG_MIMES = {"image/jpeg", "image/jpg", "image/png", "image/webp"}
@@ -2268,7 +2330,8 @@ FB_IMG_MAX = 10 * 1024 * 1024  # Telegram chỉ cho đăng ảnh (send_photo) t�
 
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Nhận ảnh feedback: ảnh thường HOẶC ảnh gửi dạng file (vd qr.jpg)."""
+    """Nhận ảnh feedback: ảnh thường HOẶC ảnh gửi dạng file (vd qr.jpg). Nhận nhiều ảnh (album hoặc từng ảnh),
+    gom lại vào st["photos"]; sau FB_ALBUM_WAIT giây không có ảnh mới thì mới xử lý (xem fb_photos_ready)."""
     m = update.message
     st = ctx.user_data.get("await")
     doc = m.document
@@ -2287,16 +2350,40 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 K([[B("⬅️ Quay lại", callback_data=PROMPT_BACK[st["type"]])]]),
             )
             return
-        photo_id = doc.file_id
+        item = {"id": doc.file_id, "u": doc.file_unique_id, "doc": True}
     else:
-        photo_id = m.photo[-1].file_id
-    is_doc = bool(doc)
-    if caption:
-        await fb_preview(ctx, user, chat, mid, photo_id, caption, is_doc, st.get("game"))
-    else:  # ảnh không có chú thích -> xin nội dung
-        nst = {"type": "fb_text", "chat": chat, "msg": mid, "photo": photo_id, "doc": is_doc, "game": st.get("game")}
-        ctx.user_data["await"] = nst
-        await edit_or_send(ctx.bot, chat, mid, prompt_of(nst), K([[B("⬅️ Hủy", callback_data="home")]]))
+        ph = m.photo[-1]
+        item = {"id": ph.file_id, "u": ph.file_unique_id, "doc": False}
+    photos = st.setdefault("photos", [])
+    if not any(p["u"] == item["u"] for p in photos):  # bỏ ảnh trùng
+        if len(photos) >= FB_PHOTOS_MAX:
+            st["over"] = True
+        else:
+            photos.append(item)
+    if caption and not st.get("caption"):
+        st["caption"] = caption
+    st["flush"] = st.get("flush", 0) + 1
+    bg(fb_photos_ready(ctx, user, st, st["flush"]))
+
+
+async def fb_photos_ready(ctx, user, st, gen):
+    """Chạy sau FB_ALBUM_WAIT giây kể từ ảnh cuối: đủ ảnh rồi -> có chú thích thì sang xác nhận, chưa có thì xin nội dung."""
+    await asyncio.sleep(FB_ALBUM_WAIT)
+    if ctx.user_data.get("await") is not st or st.get("flush") != gen:
+        return  # có ảnh mới hơn đang chờ gom, hoặc khách đã thoát / đổi bước
+    chat, mid = st["chat"], st["msg"]
+    photos = st.get("photos") or []
+    if not photos:
+        return
+    try:
+        if st.get("caption"):
+            await fb_preview(ctx, user, chat, mid, photos, st["caption"], st.get("game"))
+        else:  # chưa có nội dung -> xin nội dung (vẫn cho gửi thêm ảnh)
+            st["type"] = "fb_text"
+            warn = f"\n\n⚠️ Tối đa {FB_PHOTOS_MAX} ảnh, các ảnh dư đã bị bỏ qua." if st.pop("over", False) else ""
+            await edit_or_send(ctx.bot, chat, mid, prompt_of(st) + warn, K([[B("⬅️ Hủy", callback_data="home")]]))
+    except Exception:
+        log.exception("Lỗi xử lý ảnh feedback")
 
 
 def submit_feedback(uid, fid):
@@ -2331,11 +2418,12 @@ def fb_kb(fid):
     return K([[B("✅ Duyệt & đăng box", callback_data=f"fa:ok:{fid}"), B("❌ Từ chối", callback_data=f"fa:no:{fid}")]])
 
 
-async def notify_admins_photo(bot, photo_id, caption, kb=None, perm="feedback"):
+async def notify_admins_photo(bot, fb, caption, kb=None, perm="feedback"):
+    """Gửi feedback (1 hoặc nhiều ảnh) cho mọi admin có quyền duyệt feedback."""
     sent = 0
     for aid in admins_with(perm):
         try:
-            await bot.send_photo(aid, photo_id, caption=caption, reply_markup=kb)
+            await send_fb_media(bot, aid, fb, caption, kb)
             sent += 1
         except TelegramError as e:
             log.warning("Không gửi được cho admin %s: %s", aid, e)
@@ -2396,9 +2484,14 @@ async def post_feedback_to_box(bot, fb):
         # Telegram Web (link #-4294961954) chỉ hiện ID rút gọn; supergroup/kênh thật là -100 + số đó
         targets.append(int(f"-100{-FEEDBACK_CHAT}"))
     err = None
+    ids = fb_photo_ids(fb)[:FB_PHOTOS_MAX]
     for target in targets:  # targets có thể được thêm ID mới trong vòng lặp (nhóm vừa nâng cấp)
         try:
-            await bot.send_photo(target, fb["photo_id"], caption=cap, **extra)
+            if len(ids) <= 1:
+                await bot.send_photo(target, ids[0], caption=cap, **extra)
+            else:  # nhiều ảnh: gửi album, nội dung nằm ở chú thích của ảnh đầu
+                media = [InputMediaPhoto(ids[0], caption=cap, parse_mode=ParseMode.HTML)] + [InputMediaPhoto(i) for i in ids[1:]]
+                await bot.send_media_group(target, media, **extra)
             if target != FEEDBACK_CHAT:
                 log.warning("Đăng box được bằng ID %s -> hãy sửa FEEDBACK_CHAT_ID trong config.env thành giá trị này.", target)
             return None
@@ -3307,7 +3400,7 @@ async def send_pending(bot, chat_id, uid):
         m = await bot.send_message(chat_id, order_card(o), reply_markup=order_kb(o["id"]))
         db.execute("INSERT OR IGNORE INTO order_msgs(order_id,chat_id,msg_id) VALUES(?,?,?)", (o["id"], chat_id, m.message_id))
     for fb in fbs:
-        await bot.send_photo(chat_id, fb["photo_id"], caption=fb_card(fb), reply_markup=fb_kb(fb["id"]))
+        await send_fb_media(bot, chat_id, fb, fb_card(fb), fb_kb(fb["id"]))
 
 
 @admin_only
