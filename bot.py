@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-KEY SHOP BOT - Telegram bot bán key / nạp tiền / gifcode / feedback / CSKH
+KEY SHOP BOT - Telegram bot bán key / nạp tiền / gifcode / feedback / góp ý (hòm thư admin) / CSKH
 Chạy:  pip install -r requirements.txt  ->  python bot.py
 Cấu hình trong file config.env (+ tab "Bot Tele" ở panel sunviw: giá, link game, CSKH, box, admin... — panel được ưu tiên)
 
@@ -111,6 +111,10 @@ BANK_MAX_AGE = max(1, int(os.getenv("BANK_MAX_AGE_H", "72") or 72)) * 3600  # b�
 FB_MAX = 600  # độ dài tối đa nội dung feedback
 FB_PHOTOS_MAX = 10  # số ảnh tối đa mỗi feedback (Telegram cho tối đa 10 ảnh / album)
 FB_ALBUM_WAIT = 1.5  # giây đợi các ảnh của cùng 1 lần gửi (album) về đủ rồi mới xử lý
+SG_MAX = 1000  # độ dài tối đa 1 góp ý (gửi riêng cho admin, vào hòm thư)
+SG_COOLDOWN = 30  # giây tối thiểu giữa 2 lần gửi góp ý của cùng 1 khách
+SG_PER_DAY = 10  # số góp ý tối đa / khách / 24 giờ
+MAIL_PER_PAGE = 5  # số góp ý mỗi trang trong hòm thư admin
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE, "shop.db"))
 
 # Các biến dưới đây do apply_cfg() điền (config.env + panel):
@@ -226,6 +230,9 @@ CREATE TABLE IF NOT EXISTS logs(
     detail TEXT, extra TEXT, amount INTEGER NOT NULL DEFAULT 0, at INTEGER);
 CREATE TABLE IF NOT EXISTS feedback(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, text TEXT, at INTEGER);
+CREATE TABLE IF NOT EXISTS suggestions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
+    at INTEGER, read_by INTEGER, read_at INTEGER);
 CREATE TABLE IF NOT EXISTS promos(
     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, value INTEGER NOT NULL,
     game TEXT, pkg_code TEXT, min_amount INTEGER NOT NULL DEFAULT 0,
@@ -342,7 +349,7 @@ def gen_code(prefix="GC", n=8):
 #                (mặc định: duyệt đơn nạp · duyệt feedback · broadcast) — đổi quyền có hiệu lực trong vài giây, không cần làm gì ở bot.
 # Các ID sau ID đầu trong danh sách admin cũ (config.env) vẫn được giữ như admin phụ với quyền mặc định.
 PERM_NAME = {
-    "deposit": "Duyệt đơn nạp tiền", "feedback": "Duyệt feedback", "broadcast": "Thông báo toàn bot (broadcast)",
+    "deposit": "Duyệt đơn nạp tiền", "feedback": "Duyệt feedback &amp; đọc hòm thư góp ý", "broadcast": "Thông báo toàn bot (broadcast)",
     "gift": "Tạo / xóa gifcode", "promo": "Tạo / sửa ưu đãi",
 }
 BOT_PERMS = tuple(PERM_NAME)  # các quyền có tác dụng ở bot (các quyền còn lại của admin chính chỉ có ở panel)
@@ -816,7 +823,7 @@ def home_screen(u):
         f"{LINE}\n"
         f"{note}"
     )
-    # Khách: Mua Key / Nạp Tiền / Feedback / Lịch sử số dư / (Game đã mua key — chỉ hiện khi còn key còn hạn) / CSKH.
+    # Khách: Mua Key / Nạp Tiền / Feedback / Lịch sử số dư / (Game đã mua key — chỉ hiện khi còn key còn hạn) / CSKH + Góp ý.
     rows = [
         [B("🛒 Mua Key", callback_data="buy"), B("💰 Nạp Tiền", callback_data="dep")],
         [B("💬 Feedback", callback_data="fb"), B("📜 Lịch Sử Số Dư", callback_data="hist")],
@@ -824,7 +831,7 @@ def home_screen(u):
     if key_view(u["id"]):  # 0/6 game còn key (chưa mua / hết hạn hết) -> nút tự ẩn
         rows.append([B("🔑 Game Đã Mua Key", callback_data="mk")])
     url = cskh_url()
-    rows.append([B("🎧 CSKH", url=url) if url else B("🎧 CSKH", callback_data="cskh_none")])
+    rows.append([B("🎧 CSKH", url=url) if url else B("🎧 CSKH", callback_data="cskh_none"), B("📮 Góp Ý", callback_data="sg")])
     if adm:
         rows.append([B("🛠 Bảng Admin", callback_data="adm")])
     return text, K(rows)
@@ -1074,6 +1081,12 @@ def build_prompts():
                 f"📸 Muốn thêm ảnh thì cứ gửi tiếp.\n"
                 f"✍️ Xong thì gõ <b>nội dung feedback</b> rồi gửi vào đây (tối đa {FB_MAX} ký tự)."
             ),
+            "sg_text": (
+                f"📮 <b>GỬI GÓP Ý</b>\n{LINE}\n"
+                f"✍️ Gõ nội dung góp ý rồi gửi vào đây (tối đa {SG_MAX} ký tự).\n"
+                f"Góp ý được gửi <b>riêng cho admin</b>, không đăng công khai.\n\n"
+                f"<i>Ví dụ: muốn thêm game, báo lỗi, góp ý về giá / giao diện / hỗ trợ...</i>"
+            ),
             "bc": (
                 f"📢 <b>THÔNG BÁO TOÀN BOT</b>\n{LINE}\n"
                 f"Gõ nội dung thông báo rồi gửi vào đây (chữ thuần, tối đa {BC_MAX} ký tự). "
@@ -1085,7 +1098,7 @@ def build_prompts():
 
 BC_MAX = 3500  # độ dài tối đa 1 thông báo (khớp giới hạn của sunviw)
 build_prompts()
-PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "bc": "adm"}
+PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "bc": "adm"}
 
 # ============================== GỬI / SỬA TIN NHẮN ==============================
 
@@ -2402,6 +2415,9 @@ async def route(q, ctx, data):
     if data == "fb":
         await show(q, ctx, *fb_game_screen())
         return
+    if data == "sg":  # khách gửi góp ý (chữ) -> vào hòm thư admin
+        await start_prompt(q, ctx, "sg_text")
+        return
     if data.startswith("fbg:"):
         game = db.execute("SELECT code FROM games WHERE code=? AND api=1 AND sell=1", (data[4:],)).fetchone()
         if not game:
@@ -2439,6 +2455,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ============================== NHẬP TEXT (số tiền / gifcode / feedback) ==============================
 
 _last_fb = {}
+_last_sg = {}
 
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2533,6 +2550,28 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not text:
             return await err("⚠️ Hãy gõ nội dung feedback bằng chữ.")
         await fb_preview(ctx, user, chat, mid, st.get("photos") or [], text, st.get("game"))
+
+    elif st["type"] == "sg_text":  # góp ý riêng cho admin -> lưu vào hòm thư (admin tự vào Bảng admin để đọc)
+        if not text:
+            return await err("⚠️ Hãy gõ nội dung góp ý bằng chữ.")
+        if len(text) > SG_MAX:
+            return await err(f"⚠️ Quá dài ({len(text)}/{SG_MAX} ký tự). Hãy rút gọn.")
+        wait = SG_COOLDOWN - (time.time() - _last_sg.get(uid, 0))
+        if wait > 0:
+            return await err(f"⏳ Bạn gửi hơi nhanh, đợi {int(wait) + 1} giây rồi gửi lại nhé.")
+        sent_today = db.execute(
+            "SELECT COUNT(*) FROM suggestions WHERE user_id=? AND at>?", (uid, int(time.time()) - 86400)
+        ).fetchone()[0]
+        if sent_today >= SG_PER_DAY:
+            return await err(f"⛔ Hôm nay bạn đã gửi tối đa {SG_PER_DAY} góp ý. Mai gửi tiếp nhé!")
+        ctx.user_data.pop("await", None)
+        _last_sg[uid] = time.time()
+        db.execute("INSERT INTO suggestions(user_id,text,at) VALUES(?,?,?)", (uid, text, int(time.time())))
+        await edit_or_send(
+            ctx.bot, chat, mid,
+            f"✅ <b>ĐÃ GỬI GÓP Ý</b>\n{LINE}\nCảm ơn bạn! Góp ý đã được chuyển tới admin.",
+            K([[B("📮 Gửi thêm", callback_data="sg"), B("🏠 Trang chủ", callback_data="home")]]),
+        )
 
 
 # ============================== FEEDBACK (ảnh + nội dung -> admin duyệt -> đăng lên box) ==============================
@@ -3103,12 +3142,14 @@ def admin_panel(uid):
     n_fb = db.execute("SELECT COUNT(*) FROM feedback WHERE status='pending'").fetchone()[0]
     n_gift = db.execute("SELECT COUNT(*) FROM giftcodes WHERE used_count<max_uses").fetchone()[0]
     n_pur = db.execute("SELECT COUNT(*) FROM purchases WHERE status='pending'").fetchone()[0]
+    n_sg = db.execute("SELECT COUNT(*) FROM suggestions WHERE read_at IS NULL").fetchone()[0]
     text = (
         f"🛠 <b>BẢNG ADMIN</b> · <b>{role_text(uid)}</b>\n{LINE}\n"
         f"👥 Khách: <b>{n_user}</b>\n"
         f"⏳ Chờ duyệt: <b>{n_ord}</b> đơn nạp · <b>{n_fb}</b> feedback\n"
         f"🔥 Ưu đãi đang chạy: <b>{len(active_promos())}</b>\n"
         f"🎁 Gifcode còn lượt: <b>{n_gift}</b>\n"
+        + (f"📮 Hòm thư: <b>{n_sg}</b> góp ý chưa đọc\n" if "feedback" in perms else "")
         + (f"⚠️ Đơn key đang chờ sunviw: <b>{n_pur}</b>\n" if n_pur and is_main(uid) else "")
         + f"{LINE}\n"
     )
@@ -3126,6 +3167,8 @@ def admin_panel(uid):
         row.append(B("⏳ Chờ Duyệt", callback_data="adm:pending"))
     row.append(B("🎮 Trạng Thái Game", callback_data="adm:stock"))
     rows.append(row)
+    if "feedback" in perms:
+        rows.append([B(f"📮 Hòm Thư Góp Ý ({n_sg})" if n_sg else "📮 Hòm Thư Góp Ý", callback_data="adm:mail")])
     if "broadcast" in perms:
         rows.append([B("📢 Thông Báo Toàn Bot", callback_data="bc:go")])
     rows.append([B("📖 Lệnh Khác", callback_data="adm:help"), B("🏠 Trang chủ", callback_data="home")])
@@ -3508,6 +3551,121 @@ async def wiz_route(q, ctx, data, uid):
     return alert
 
 
+# ============================== HÒM THƯ GÓP Ý ==============================
+# Khách bấm "📮 Góp Ý" ở trang chủ -> gõ chữ -> lưu bảng suggestions. Admin có quyền "feedback" đọc ở Bảng admin → "📮 Hòm Thư Góp Ý".
+# Chưa đọc = read_at IS NULL; mở 1 góp ý là tự đánh dấu đã đọc.
+
+
+def mail_counts():
+    r = db.execute("SELECT COUNT(*) a, SUM(CASE WHEN read_at IS NULL THEN 1 ELSE 0 END) n FROM suggestions").fetchone()
+    return r["a"] or 0, r["n"] or 0
+
+
+def mail_snip(text, n=60):
+    t = " ".join((text or "").split())
+    return esc(t if len(t) <= n else t[: n - 1] + "…")
+
+
+def mail_list_screen(flt="n", page=0):
+    """flt: n = chỉ chưa đọc · a = tất cả. Mới nhất lên đầu."""
+    total, unread = mail_counts()
+    count = unread if flt == "n" else total
+    pages = max(1, -(-count // MAIL_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    where = "WHERE s.read_at IS NULL" if flt == "n" else ""
+    rows = db.execute(
+        "SELECT s.id, s.user_id, s.text, s.at, s.read_at, u.name FROM suggestions s "
+        f"LEFT JOIN users u ON u.id=s.user_id {where} ORDER BY s.id DESC LIMIT ? OFFSET ?",
+        (MAIL_PER_PAGE, page * MAIL_PER_PAGE),
+    ).fetchall()
+    out, btns = [], []
+    for r in rows:
+        mark = "⚪" if r["read_at"] else "🔵"
+        out.append(f"{mark} <code>#{r['id']}</code> <b>{esc(r['name'] or 'Khách')}</b> · {fmt_time(r['at'])}\n      {mail_snip(r['text'])}")
+        btns.append(B(f"{mark} #{r['id']}", callback_data=f"adm:mv:{r['id']}:{flt}:{page}"))
+    body = "\n".join(out) if out else ("<i>Không có góp ý chưa đọc 🎉</i>" if flt == "n" else "<i>Hòm thư đang trống.</i>")
+    text = (
+        f"📮 <b>HÒM THƯ GÓP Ý</b>\n{LINE}\n"
+        f"📬 Chưa đọc: <b>{unread}</b> · Tổng: <b>{total}</b>\n{LINE}\n"
+        f"{body}\n{LINE}\n"
+        f"🔵 chưa đọc · ⚪ đã đọc · <i>Bấm số góp ý để đọc đầy đủ</i>"
+    )
+    kb = [btns[i : i + 3] for i in range(0, len(btns), 3)]
+    kb.append(
+        [
+            B(("• " if flt == "n" else "") + "🔵 Chưa đọc", callback_data="adm:mail:n:0"),
+            B(("• " if flt == "a" else "") + "📚 Tất cả", callback_data="adm:mail:a:0"),
+        ]
+    )
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(B("◀️ Trước", callback_data=f"adm:mail:{flt}:{page - 1}"))
+        nav.append(B(f"{page + 1}/{pages}", callback_data=f"adm:mail:{flt}:{page}"))
+        if page < pages - 1:
+            nav.append(B("Sau ▶️", callback_data=f"adm:mail:{flt}:{page + 1}"))
+        kb.append(nav)
+    if unread:
+        kb.append([B("✅ Đánh dấu đã đọc hết", callback_data="adm:mra")])
+    kb.append([B("⬅️ Bảng admin", callback_data="adm")])
+    return text, K(kb)
+
+
+def mail_view_screen(sid, flt="n", page=0):
+    """Chi tiết 1 góp ý (None nếu không còn)."""
+    r = db.execute(
+        "SELECT s.*, u.name, u.username FROM suggestions s LEFT JOIN users u ON u.id=s.user_id WHERE s.id=?", (sid,)
+    ).fetchone()
+    if not r:
+        return None
+    uname = f" (@{esc(r['username'])})" if r["username"] else ""
+    text = (
+        f"📮 <b>GÓP Ý #{sid}</b>\n{LINE}\n"
+        f"👤 <b>{esc(r['name'] or 'Khách')}</b>{uname}\n"
+        f"🆔 <code>{r['user_id']}</code>\n"
+        f"🕐 {fmt_time(r['at'])}\n{LINE}\n"
+        f"{esc(r['text'])}"
+    )
+    url = f"https://t.me/{r['username']}" if r["username"] else f"tg://user?id={r['user_id']}"
+    kb = K(
+        [
+            [B("💬 Nhắn khách", url=url)],
+            [B("🗑 Xóa", callback_data=f"adm:md:{sid}:{flt}:{page}"), B("⬅️ Hòm thư", callback_data=f"adm:mail:{flt}:{page}")],
+        ]
+    )
+    return text, kb
+
+
+async def mail_route(q, ctx, data, uid):
+    """adm:mail[:flt:page] · adm:mv:<id>[:flt:page] (mở + đánh dấu đã đọc) · adm:md:<id>[:flt:page] (xóa) · adm:mra (đọc hết)."""
+    p = data.split(":")
+
+    def flt_page(i):
+        f = p[i] if len(p) > i and p[i] in ("n", "a") else "n"
+        pg = int(p[i + 1]) if len(p) > i + 1 and p[i + 1].isdigit() else 0
+        return f, pg
+
+    if p[1] == "mail":
+        await show(q, ctx, *mail_list_screen(*flt_page(2)))
+        return
+    if p[1] == "mra":
+        n = db.execute("UPDATE suggestions SET read_at=?, read_by=? WHERE read_at IS NULL", (int(time.time()), uid)).rowcount
+        await show(q, ctx, *mail_list_screen("n", 0))
+        return f"~✅ Đã đánh dấu {n} góp ý là đã đọc."
+    sid = int(p[2]) if len(p) > 2 and p[2].isdigit() else 0
+    flt, page = flt_page(3)
+    if p[1] == "md":
+        n = db.execute("DELETE FROM suggestions WHERE id=?", (sid,)).rowcount
+        await show(q, ctx, *mail_list_screen(flt, page))
+        return f"~🗑 Đã xóa góp ý #{sid}." if n else "Góp ý này đã bị xóa trước đó."
+    db.execute("UPDATE suggestions SET read_at=?, read_by=? WHERE id=? AND read_at IS NULL", (int(time.time()), uid, sid))
+    scr = mail_view_screen(sid, flt, page)
+    if not scr:
+        await show(q, ctx, *mail_list_screen(flt, page))
+        return "Góp ý này không còn trong hòm thư."
+    await show(q, ctx, *scr)
+
+
 async def admin_route(q, ctx, data, uid):
     chat = q.message.chat_id
     if data == "adm":
@@ -3527,6 +3685,10 @@ async def admin_route(q, ctx, data, uid):
     if data == "adm:help":
         await show(q, ctx, admin_help(uid), back)
         return
+    if data.startswith(("adm:mail", "adm:mv:", "adm:md:", "adm:mra")):  # hòm thư góp ý
+        if not has_perm(uid, "feedback"):
+            return "⛔ Bạn chưa được cấp quyền đọc hòm thư góp ý."
+        return await mail_route(q, ctx, data, uid)
     if data.startswith("aw:"):  # wizard: quyền kiểm tra theo loại (promo / gift) trong wiz_route
         return await wiz_route(q, ctx, data, uid)
     if data in ("adm:promos",) or data.startswith(("adm:pt:", "adm:pd:")):
@@ -3588,6 +3750,8 @@ def admin_help(uid):
         out.append("<code>/promo</code>  xem danh sách ưu đãi")
     if perms & {"deposit", "feedback"}:
         out.append("<code>/pending</code>  xem đơn nạp &amp; feedback đang chờ duyệt")
+    if "feedback" in perms:
+        out.append("📮 <b>Hòm thư góp ý</b>: <code>/admin</code> → <b>📮 Hòm Thư Góp Ý</b> (xem · đánh dấu đã đọc · xóa · nhắn khách)")
     if "broadcast" in perms:
         out.append("<code>/broadcast Nội dung</code>  gửi thông báo tới TẤT CẢ khách (có xem trước + xác nhận)")
     out.append("<code>/id</code>  xem ID của bạn / ID của chat (gõ trong box để lấy ID box)")
