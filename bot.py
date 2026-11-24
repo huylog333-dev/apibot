@@ -95,6 +95,19 @@ QR_FILE = os.path.join(BASE, os.getenv("QR_FILE", "qr.jpg"))
 # (tuỳ chọn) mẫu link QR động riêng, được thử TRƯỚC các nguồn có sẵn. Dùng {acc} {bank} {amount} {des} {holder}, vd:
 # QR_URL_TEMPLATE=https://vietqr.app/img?acc={acc}&bank={bank}&amount={amount}&des={des}&holder={holder}
 QR_URL_TEMPLATE = os.getenv("QR_URL_TEMPLATE", "").strip()
+
+# ---- TỰ ĐỘNG DUYỆT NẠP QUA API NGÂN HÀNG (để trống BANK_API_URL / BANK_API_TOKEN = quay về duyệt tay) ----
+# BANK_API_URL: link lấy lịch sử giao dịch của nhà cung cấp API bank, dùng {token} và {acc} (số tài khoản) làm chỗ điền, vd:
+#   BANK_API_URL=https://<nha-cung-cap>/.../{acc}/{token}
+# Nhà cung cấp dùng header thay vì nằm trong link -> BANK_API_HEADER=Authorization: Bearer {token}
+# Nhà cung cấp dùng POST -> BANK_API_METHOD=POST và BANK_API_BODY={"token":"{token}","account":"{acc}"}
+BANK_API_TOKEN = os.getenv("BANK_API_TOKEN", "").strip()
+BANK_API_URL = os.getenv("BANK_API_URL", "").strip()
+BANK_API_METHOD = os.getenv("BANK_API_METHOD", "GET").strip().upper()
+BANK_API_HEADER = os.getenv("BANK_API_HEADER", "").strip()
+BANK_API_BODY = os.getenv("BANK_API_BODY", "").strip()
+BANK_POLL_SEC = max(5, int(os.getenv("BANK_POLL_SEC", "15") or 15))  # bao nhiêu giây dò 1 lần
+BANK_MAX_AGE = max(1, int(os.getenv("BANK_MAX_AGE_H", "72") or 72)) * 3600  # bỏ qua giao dịch cũ hơn N giờ
 FB_MAX = 600  # độ dài tối đa nội dung feedback
 FB_PHOTOS_MAX = 10  # số ảnh tối đa mỗi feedback (Telegram cho tối đa 10 ảnh / album)
 FB_ALBUM_WAIT = 1.5  # giây đợi các ảnh của cùng 1 lần gửi (album) về đủ rồi mới xử lý
@@ -229,6 +242,9 @@ CREATE INDEX IF NOT EXISTS idx_pur_status ON purchases(status);
 CREATE TABLE IF NOT EXISTS order_msgs(
     order_id INTEGER NOT NULL, chat_id INTEGER NOT NULL, msg_id INTEGER NOT NULL,
     PRIMARY KEY(order_id, chat_id, msg_id));
+CREATE TABLE IF NOT EXISTS bank_tx(
+    tx_id TEXT PRIMARY KEY, order_id INTEGER, amount INTEGER NOT NULL DEFAULT 0,
+    descr TEXT, status TEXT NOT NULL, at INTEGER);
 """
 )
 
@@ -1252,7 +1268,7 @@ async def open_qr(bot, chat_id, uid, amount, gift=None):
     if bonus:
         bonus_txt += f"➡️ Tổng bạn nhận: <b>{money(amount + bonus)}</b>\n"
     if g:
-        bonus_txt += f"<i>⏱ Gifcode được giữ {GIFT_HOLD // 60} phút — hãy chuyển khoản &amp; bấm xác nhận trong thời gian này.</i>\n"
+        bonus_txt += f"<i>⏱ Gifcode được giữ {GIFT_HOLD // 60} phút — hãy chuyển khoản trong thời gian này.</i>\n" if bank_ready() else f"<i>⏱ Gifcode được giữ {GIFT_HOLD // 60} phút — hãy chuyển khoản &amp; bấm xác nhận trong thời gian này.</i>\n"
     head = (
         f"💳 <b>NẠP TIỀN — ĐƠN #{oid}</b>\n{LINE}\n"
         f"🏦 Ngân hàng: <b>{esc(BANK_NAME)}</b>\n"
@@ -1262,19 +1278,24 @@ async def open_qr(bot, chat_id, uid, amount, gift=None):
         f"{bonus_txt}"
         f"📝 Nội dung CK: <code>{code}</code>\n{LINE}\n"
     )
+    PAY_TAIL = (
+        "⚡ Tiền được <b>cộng TỰ ĐỘNG</b> ngay khi ngân hàng báo có (thường dưới 1 phút). Chuyển xong có thể bấm <b>Kiểm tra giao dịch</b>."
+        if bank_ready()
+        else "Chuyển xong bấm <b>Tôi đã chuyển khoản</b>."
+    )
     cap_dyn = (
         head
         + "📲 Quét mã QR bằng app ngân hàng — <b>số tiền &amp; nội dung CK đã tự điền sẵn</b>, bạn chỉ cần xác nhận chuyển. "
-        "Chuyển xong bấm <b>Tôi đã chuyển khoản</b>.\n<i>⚠️ Không sửa số tiền / nội dung CK.</i>"
+        + PAY_TAIL + "\n<i>⚠️ Không sửa số tiền / nội dung CK.</i>"
     )
     cap_static = (
         head
-        + "📲 Quét mã QR, nhập <b>đúng số tiền</b> &amp; <b>nội dung CK</b> như trên, "
-        "chuyển xong bấm <b>Tôi đã chuyển khoản</b>."
+        + "📲 Quét mã QR, nhập <b>đúng số tiền</b> &amp; <b>nội dung CK</b> như trên. "
+        + PAY_TAIL
     )
     kb = K(
         [
-            [B("✅ Tôi đã chuyển khoản", callback_data=f"paid:{oid}")],
+            [B("🔄 Kiểm tra giao dịch" if bank_ready() else "✅ Tôi đã chuyển khoản", callback_data=f"paid:{oid}")],
             [B("❌ Hủy đơn", callback_data=f"cancel:{oid}")],
         ]
     )
@@ -1326,6 +1347,280 @@ def decide_order(oid, approve, admin_id):
             if o["gift"]:
                 gift_release(c, o["gift"], o["user_id"])  # đơn bị từ chối -> trả lại lượt gifcode cho khách
         return c.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+
+
+# ============================== TỰ ĐỘNG DUYỆT NẠP (API NGÂN HÀNG) ==============================
+# Cách chạy: job nền dò lịch sử giao dịch -> giao dịch TIỀN VÀO có nội dung chứa NAP<mã đơn> + ĐÚNG số tiền của đơn
+# -> cộng tiền ngay, báo khách, đăng box. Mỗi giao dịch chỉ được xử lý 1 LẦN (bảng bank_tx, khóa theo mã giao dịch).
+# Lệch số tiền / đơn đã bị từ chối  -> KHÔNG cộng, báo admin xử lý tay.
+
+NAP_RE = re.compile(r"NAP\s*[-_.]?\s*(\d{1,9})", re.I)
+_bank_lock = None
+_bank_last_check = {}
+_bank_state = {"ok": None, "err": "", "fails": 0, "alerted": False}
+
+
+def bank_ready():
+    return bool(BANK_API_TOKEN and BANK_API_URL)
+
+
+def _num(v):
+    s = str(v if v is not None else "").strip().replace(" ", "")
+    if not s:
+        return 0
+    if re.fullmatch(r"\d{1,3}(\.\d{3})+", s):  # 30.000 kiểu VN
+        s = s.replace(".", "")
+    s = s.replace(",", "")
+    try:
+        return int(float(s))
+    except ValueError:
+        return 0
+
+
+def _find_list(o, depth=0):
+    """Tìm danh sách giao dịch trong JSON (TranList / transactions / data ...)."""
+    if isinstance(o, list):
+        return o
+    if isinstance(o, dict) and depth < 3:
+        for k in ("TranList", "tranList", "transactions", "data", "result", "items", "list", "history"):
+            if k in o:
+                r = _find_list(o[k], depth + 1)
+                if r is not None:
+                    return r
+        for v in o.values():
+            if isinstance(v, (list, dict)):
+                r = _find_list(v, depth + 1)
+                if r is not None:
+                    return r
+    return None
+
+
+def _tx_time(t):
+    for k in ("transactionDate", "postingDate", "transaction_date", "transactionTime", "time", "date"):
+        s = str(t.get(k) or "").strip()
+        for fmt in ("%d/%m/%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(s[:19], fmt).replace(tzinfo=VN).timestamp()
+            except ValueError:
+                pass
+    return None
+
+
+def _parse_tx(t):
+    """1 dòng lịch sử -> {id, amount, desc, ts} nếu là giao dịch TIỀN VÀO, ngược lại None."""
+    if not isinstance(t, dict):
+        return None
+    credit = _num(t.get("creditAmount")) or _num(t.get("amountIn")) or _num(t.get("amount_in"))
+    if not credit:
+        typ = str(t.get("type") or t.get("transfer_type") or t.get("transferType") or "").strip().upper()
+        if typ in ("IN", "CREDIT", "C"):
+            credit = _num(t.get("amount") or t.get("transferAmount"))
+    if credit <= 0:
+        return None
+    desc = " ".join(
+        str(t.get(k) or "")
+        for k in ("description", "content", "transaction_content", "transactionContent", "addDescription", "remark", "memo")
+    ).strip()
+    ref = ""
+    for k in ("refNo", "tranId", "transactionID", "transactionId", "transaction_id", "reference_number", "referenceCode", "id"):
+        if t.get(k):
+            ref = str(t[k])
+            break
+    ts = _tx_time(t)
+    if not ref:
+        ref = hashlib.sha1(f"{ts}|{credit}|{desc}".encode()).hexdigest()[:20]
+    return {"id": f"{ref}|{credit}", "amount": credit, "desc": desc, "ts": ts}
+
+
+def _bank_fetch_sync():
+    """Gọi API ngân hàng -> list dict giao dịch. Không bao giờ log URL (có token)."""
+    tok = BANK_API_TOKEN
+    fill = lambda s: s.replace("{token}", urllib.parse.quote(tok, safe="")).replace(  # noqa: E731
+        "{acc}", urllib.parse.quote(BANK_ACCOUNT, safe="")
+    )
+    headers = {"User-Agent": "Mozilla/5.0 (KeyShopBot)", "Accept": "application/json"}
+    if BANK_API_HEADER and ":" in BANK_API_HEADER:
+        hk, hv = BANK_API_HEADER.split(":", 1)
+        headers[hk.strip()] = hv.strip().replace("{token}", tok).replace("{acc}", BANK_ACCOUNT)
+    body = None
+    if BANK_API_METHOD == "POST":
+        body = (BANK_API_BODY.replace("{token}", tok).replace("{acc}", BANK_ACCOUNT)).encode()
+        headers.setdefault("Content-Type", "application/json")
+    req = urllib.request.Request(fill(BANK_API_URL), data=body, headers=headers, method=BANK_API_METHOD)
+    with urllib.request.urlopen(req, timeout=8) as r:
+        raw = r.read(5_000_000).decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        raise ValueError("phản hồi không phải JSON: " + raw[:120].replace(tok, "***"))
+    rows = _find_list(data)
+    if rows is None:
+        raise ValueError("không thấy danh sách giao dịch trong phản hồi: " + raw[:160].replace(tok, "***"))
+    return rows
+
+
+def bank_apply(t):
+    """Áp 1 giao dịch tiền vào lên đơn nạp. -> (kind, order, lý do)
+    kind: credited (đã cộng) | mismatch (cần admin) | dup (đã xử lý rồi) | nomatch (không phải đơn nạp của bot)."""
+    now = int(time.time())
+    with tx() as c:
+        if c.execute("SELECT 1 FROM bank_tx WHERE tx_id=?", (t["id"],)).fetchone():
+            return "dup", None, ""
+
+        def rec(status, oid=None):
+            c.execute(
+                "INSERT INTO bank_tx(tx_id,order_id,amount,descr,status,at) VALUES(?,?,?,?,?,?)",
+                (t["id"], oid, t["amount"], t["desc"][:200], status, now),
+            )
+
+        m = NAP_RE.search(t["desc"])
+        o = None
+        if m:
+            oid = int(m.group(1))
+            o = c.execute("SELECT * FROM orders WHERE id=? AND code=?", (oid, f"NAP{oid}")).fetchone()
+        if not o:
+            rec("ignored")
+            return "nomatch", None, ""
+        if o["status"] == "approved":  # đơn đã được cộng (duyệt tay cũ / giao dịch cũ) -> chỉ ghi sổ
+            rec("dup_order", o["id"])
+            log.info("Giao dịch %s trùng đơn #%s đã cộng trước đó -> bỏ qua", t["id"], o["id"])
+            return "dup", o, ""
+        if o["status"] == "rejected":
+            rec("mismatch", o["id"])
+            return "mismatch", o, "đơn này admin đã TỪ CHỐI trước đó"
+        if t["amount"] != o["amount"]:
+            rec("mismatch", o["id"])
+            return "mismatch", o, f"khách chuyển {money(t['amount'])} nhưng đơn là {money(o['amount'])}"
+        bonus = o["bonus"] or 0
+        if o["status"] == "canceled":  # khách chuyển sau khi đơn bị hủy / hết hạn giữ gifcode -> cộng tiền gốc, bỏ tiền tặng
+            bonus = 0
+        elif o["status"] not in ("waiting_pay", "pending"):
+            rec("ignored", o["id"])
+            return "nomatch", None, ""
+        c.execute("UPDATE orders SET status='approved', bonus=?, handled_by=0, handled_at=? WHERE id=?", (bonus, now, o["id"]))
+        c.execute(
+            "UPDATE users SET balance=balance+?, total_deposit=total_deposit+? WHERE id=?",
+            (o["amount"] + bonus, o["amount"], o["user_id"]),
+        )
+        add_log(c, o["user_id"], "deposit", f"Đơn #{o['id']}", str(bonus) if bonus else "", o["amount"] + bonus)
+        rec("credited", o["id"])
+        return "credited", c.execute("SELECT * FROM orders WHERE id=?", (o["id"],)).fetchone(), ""
+
+
+async def _after_credit(app, o):
+    bot = app.bot
+    await clear_order_msgs(bot, o["id"])  # gỡ thẻ duyệt tay ở admin (nếu đơn đã lỡ gửi)
+    if o["msg_id"]:
+        await delete_by_id(bot, o["user_id"], o["msg_id"])  # xóa tin QR / tin chờ của khách
+    try:
+        await notify_user_order(bot, o)
+    except TelegramError as e:  # khách chặn bot...: đã cộng tiền, chỉ không báo được
+        log.warning("Không báo được kết quả đơn #%s cho khách: %s", o["id"], e)
+    buyer = reload_user(o["user_id"])
+    app.create_task(post_box(bot, deposit_box_text(buyer["name"] if buyer else "", o["amount"], o["bonus"] or 0)))
+    log.info("✅ AUTO nạp đơn #%s · khách %s · +%s", o["id"], o["user_id"], o["amount"] + (o["bonus"] or 0))
+
+
+async def _alert_mismatch(app, o, t, why):
+    u = reload_user(o["user_id"])
+    text = (
+        f"⚠️ <b>GIAO DỊCH NẠP CẦN XỬ LÝ TAY</b>\n{LINE}\n"
+        f"📝 Nội dung: <code>{esc(t['desc'][:120])}</code>\n"
+        f"💵 Tiền vào: <b>{money(t['amount'])}</b>\n"
+        f"🧾 Đơn <b>#{o['id']}</b> · khách <code>{o['user_id']}</code> ({esc(u['name'] if u else '?')})\n"
+        f"❗ Lý do không tự cộng: {esc(why)}\n"
+        f"<i>Bot đã KHÔNG cộng tiền cho giao dịch này.</i>"
+    )
+    await notify_admins(app.bot, text)
+
+
+async def bank_poll(app):
+    """Dò API ngân hàng 1 lần -> số đơn vừa được cộng tự động."""
+    global _bank_lock
+    if not bank_ready():
+        return 0
+    if _bank_lock is None:
+        _bank_lock = asyncio.Lock()
+    async with _bank_lock:
+        try:
+            rows = await asyncio.get_running_loop().run_in_executor(None, _bank_fetch_sync)
+        except Exception as e:  # noqa: BLE001
+            _bank_state.update(ok=False, err=str(e)[:200], fails=_bank_state["fails"] + 1)
+            log.warning("Gọi API ngân hàng lỗi: %s", str(e)[:200])
+            if _bank_state["fails"] >= 8 and not _bank_state["alerted"]:  # lỗi liên tục -> báo admin chính 1 lần
+                _bank_state["alerted"] = True
+                for aid in ADMIN_IDS[:1]:
+                    try:
+                        await app.bot.send_message(
+                            aid,
+                            "⚠️ <b>Bot không gọi được API ngân hàng</b> — nạp tiền tự động đang TẠM DỪNG.\n"
+                            f"Lỗi: <code>{esc(_bank_state['err'])}</code>\nKiểm tra BANK_API_URL / BANK_API_TOKEN (gõ /bank để thử).",
+                        )
+                    except TelegramError:
+                        pass
+            return 0
+        _bank_state.update(ok=True, err="", fails=0, alerted=False)
+        done = 0
+        for raw in reversed(rows):  # cũ -> mới
+            t = _parse_tx(raw)
+            if not t or (t["ts"] and time.time() - t["ts"] > BANK_MAX_AGE):
+                continue
+            try:
+                kind, o, why = bank_apply(t)
+                if kind == "credited":
+                    done += 1
+                    await _after_credit(app, o)
+                elif kind == "mismatch":
+                    await _alert_mismatch(app, o, t, why)
+            except Exception:  # noqa: BLE001 — 1 giao dịch lỗi không được làm hỏng cả lượt dò
+                log.exception("Lỗi xử lý giao dịch ngân hàng %s", t["id"])
+        return done
+
+
+def _bank_need_poll():
+    """Chỉ dò khi có đơn đang chờ tiền (tiết kiệm lượt gọi API)."""
+    now = int(time.time())
+    r = db.execute(
+        "SELECT 1 FROM orders WHERE (status IN ('waiting_pay','pending') AND created>?) OR created>? LIMIT 1",
+        (now - 86400, now - 1800),
+    ).fetchone()
+    return bool(r)
+
+
+async def bank_loop(app):
+    first = True
+    while True:
+        try:
+            if first or _bank_need_poll():
+                await bank_poll(app)
+                first = False
+            await asyncio.sleep(BANK_POLL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Lỗi job dò ngân hàng")
+            await asyncio.sleep(BANK_POLL_SEC)
+
+
+async def cmd_bank(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """/bank — (admin chính) thử gọi API ngân hàng, xem bot đọc được những giao dịch nào."""
+    if not update.effective_user or not is_main(update.effective_user.id):
+        return
+    if not bank_ready():
+        await update.message.reply_text("⚠️ Chưa cấu hình <code>BANK_API_URL</code> / <code>BANK_API_TOKEN</code> trong config.env → đang duyệt tay.")
+        return
+    try:
+        rows = await asyncio.get_running_loop().run_in_executor(None, _bank_fetch_sync)
+    except Exception as e:  # noqa: BLE001
+        await update.message.reply_text(f"❌ Lỗi gọi API ngân hàng:\n<code>{esc(str(e)[:300])}</code>")
+        return
+    ins = [t for t in (_parse_tx(r) for r in rows) if t]
+    lines = [f"• <b>+{money(t['amount'])}</b> · {esc(t['desc'][:60])}" for t in ins[:5]] or ["(chưa có giao dịch tiền vào)"]
+    await update.message.reply_text(
+        f"✅ <b>API ngân hàng OK</b>\n{LINE}\nĐọc được {len(rows)} giao dịch, {len(ins)} giao dịch tiền vào. Gần nhất:\n"
+        + "\n".join(lines)
+        + f"\n{LINE}\nDò mỗi {BANK_POLL_SEC}s khi có đơn chờ."
+    )
 
 
 def order_card(o):
@@ -1885,6 +2180,23 @@ async def route(q, ctx, data):
         return
     if data.startswith("paid:"):
         oid = int(data[5:])
+        if bank_ready():  # AUTO: nút này chỉ để khách bấm kiểm tra ngay (không còn gửi admin duyệt tay)
+            o = db.execute("SELECT * FROM orders WHERE id=? AND user_id=?", (oid, uid)).fetchone()
+            if not o or o["status"] not in ("waiting_pay", "pending", "approved"):
+                return "Đơn này đã hết hiệu lực."
+            if o["status"] == "approved":
+                return "~✅ Đơn này đã được cộng tiền rồi."
+            now = time.time()
+            if now - _bank_last_check.get(uid, 0) < 5:
+                return "~⏳ Đang kiểm tra, vui lòng đợi vài giây rồi bấm lại."
+            _bank_last_check[uid] = now
+            await bank_poll(ctx.application)
+            o = db.execute("SELECT status FROM orders WHERE id=?", (oid,)).fetchone()
+            if o and o["status"] == "approved":
+                return  # bank_poll đã gửi thông báo nạp thành công cho khách
+            if _bank_state["ok"] is False:
+                return "⚠️ Hệ thống chưa kết nối được ngân hàng lúc này. Nếu bạn đã chuyển khoản, tiền sẽ được cộng tự động khi kết nối lại — không cần bấm lại."
+            return "⏳ Chưa thấy tiền về tài khoản. Nếu bạn vừa chuyển, vui lòng đợi 1–2 phút — hệ thống sẽ TỰ ĐỘNG cộng tiền, không cần bấm lại."
         o = submit_order(uid, oid)
         if not o:
             return "Đơn này đã hết hiệu lực hoặc đã được gửi trước đó."
@@ -2744,6 +3056,11 @@ async def post_init(app):
         await sync_once(app)
     _loops.append(asyncio.ensure_future(sync_loop(app)))
     _loops.append(asyncio.ensure_future(purchase_recovery_loop(app)))
+    if bank_ready():
+        _loops.append(asyncio.ensure_future(bank_loop(app)))
+        log.info("💳 Nạp tiền TỰ ĐỘNG qua API ngân hàng: BẬT (dò mỗi %ss)", BANK_POLL_SEC)
+    else:
+        log.warning("💳 Chưa có BANK_API_URL / BANK_API_TOKEN -> nạp tiền vẫn DUYỆT TAY.")
 
 
 async def post_shutdown(app):
@@ -3553,6 +3870,7 @@ def register(app: Application):
     app.add_handler(CommandHandler(["game", "stock"], cmd_stock, filters=pv))
     app.add_handler(CommandHandler("promo", cmd_promo, filters=pv))
     app.add_handler(CommandHandler("pending", cmd_pending, filters=pv))
+    app.add_handler(CommandHandler("bank", cmd_bank, filters=pv))
     app.add_handler(CommandHandler("broadcast", perm_only("broadcast", cmd_broadcast), filters=pv))
     app.add_handler(CommandHandler(["id", "chatid"], cmd_id))  # dùng được cả trong nhóm (sub-admin dùng để lấy Chat ID khi nhập key)
     app.add_handler(CallbackQueryHandler(on_button))
