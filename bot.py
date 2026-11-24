@@ -115,6 +115,12 @@ SG_MAX = 1000  # độ dài tối đa 1 góp ý (gửi riêng cho admin, vào h�
 SG_COOLDOWN = 30  # giây tối thiểu giữa 2 lần gửi góp ý của cùng 1 khách
 SG_PER_DAY = 10  # số góp ý tối đa / khách / 24 giờ
 MAIL_PER_PAGE = 5  # số góp ý mỗi trang trong hòm thư admin
+_exp_h = os.getenv("EXPIRY_REMIND_HOURS", "24").strip()
+EXPIRY_REMIND = (int(_exp_h) if re.fullmatch(r"\d+", _exp_h) else 24) * 3600  # nhắc khách khi key còn dưới N giờ (0 = tắt nhắc)
+EXPIRY_TICK = 300  # giây giữa 2 lượt quét nhắc hết hạn
+EXPIRY_BATCH = 80  # số khách tối đa hỏi sunviw mỗi lượt quét
+CM_PER_PAGE = 6  # số khách mỗi trang trong Quản lý khách
+CM_ADJ_MAX = 1_000_000_000  # tối đa 1 lần cộng / trừ tiền
 DB_PATH = os.getenv("DB_PATH", os.path.join(BASE, "shop.db"))
 
 # Các biến dưới đây do apply_cfg() điền (config.env + panel):
@@ -233,6 +239,8 @@ CREATE TABLE IF NOT EXISTS feedback(
 CREATE TABLE IF NOT EXISTS suggestions(
     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, text TEXT NOT NULL,
     at INTEGER, read_by INTEGER, read_at INTEGER);
+CREATE TABLE IF NOT EXISTS key_reminders(
+    key_text TEXT PRIMARY KEY, user_id INTEGER NOT NULL, exp INTEGER, at INTEGER);
 CREATE TABLE IF NOT EXISTS promos(
     id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, value INTEGER NOT NULL,
     game TEXT, pkg_code TEXT, min_amount INTEGER NOT NULL DEFAULT 0,
@@ -292,6 +300,7 @@ _ensure_cols(
 _ensure_cols("feedback", {"game": "TEXT"})  # game khách chọn khi gửi feedback
 _ensure_cols("feedback", {"photos": "TEXT", "album": "TEXT"})  # photos = JSON list file_id (nhiều ảnh); album = JSON list message_id album ở chat khách (để xóa)
 _ensure_cols("users", {"blocked": "INTEGER NOT NULL DEFAULT 0"})  # khách đã chặn bot -> broadcast bỏ qua
+_ensure_cols("users", {"banned": "INTEGER NOT NULL DEFAULT 0"})  # admin chính khóa tài khoản khách (không dùng được bot)
 
 
 # ============================== TIỆN ÍCH ==============================
@@ -349,7 +358,7 @@ def gen_code(prefix="GC", n=8):
 #                (mặc định: duyệt đơn nạp · duyệt feedback · broadcast) — đổi quyền có hiệu lực trong vài giây, không cần làm gì ở bot.
 # Các ID sau ID đầu trong danh sách admin cũ (config.env) vẫn được giữ như admin phụ với quyền mặc định.
 PERM_NAME = {
-    "deposit": "Duyệt đơn nạp tiền", "feedback": "Duyệt feedback &amp; đọc hòm thư góp ý", "broadcast": "Thông báo toàn bot (broadcast)",
+    "deposit": "Duyệt đơn nạp tiền", "feedback": "Duyệt feedback", "broadcast": "Thông báo toàn bot (broadcast)",
     "gift": "Tạo / xóa gifcode", "promo": "Tạo / sửa ưu đãi",
 }
 BOT_PERMS = tuple(PERM_NAME)  # các quyền có tác dụng ở bot (các quyền còn lại của admin chính chỉ có ở panel)
@@ -988,6 +997,9 @@ def hist_line(kind, r):
         return f"✅ <b>{t}</b> · Nạp tiền <b>thành công</b> <b>+{money(r['amount'])}</b>{note} <i>({esc(r['detail'])})</i>"
     if r["kind"] == "gift_money":
         return f"🎁 <b>{t}</b> · {esc(r['detail'])} <b>+{money(r['amount'])}</b>"
+    if r["kind"] == "adj":  # admin chính cộng / trừ tiền
+        sign = f"+{money(r['amount'])}" if r["amount"] >= 0 else f"-{money(-r['amount'])}"
+        return f"🛠 <b>{t}</b> · {esc(r['detail'])} <b>{sign}</b>"
     # key
     if r["amount"] < 0:
         head = f"🔑 <b>{t}</b> · Mua key <b>{esc(r['detail'])}</b> <b>-{money(-r['amount'])}</b>"
@@ -1081,6 +1093,18 @@ def build_prompts():
                 f"📸 Muốn thêm ảnh thì cứ gửi tiếp.\n"
                 f"✍️ Xong thì gõ <b>nội dung feedback</b> rồi gửi vào đây (tối đa {FB_MAX} ký tự)."
             ),
+            "cm_find": (
+                f"🔎 <b>TÌM KHÁCH</b>\n{LINE}\n"
+                f"Gõ <b>ID</b>, <b>@username</b> hoặc một phần <b>tên</b> của khách rồi gửi vào đây."
+            ),
+            "cm_add": (
+                f"➕ <b>CỘNG TIỀN CHO KHÁCH</b>\n{LINE}\n"
+                f"Gõ số tiền muốn cộng rồi gửi vào đây. Ví dụ: <code>50000</code> hoặc <code>50k</code>"
+            ),
+            "cm_sub": (
+                f"➖ <b>TRỪ TIỀN CỦA KHÁCH</b>\n{LINE}\n"
+                f"Gõ số tiền muốn trừ rồi gửi vào đây. Ví dụ: <code>50000</code> hoặc <code>50k</code>"
+            ),
             "sg_text": (
                 f"📮 <b>GỬI GÓP Ý</b>\n{LINE}\n"
                 f"✍️ Gõ nội dung góp ý rồi gửi vào đây (tối đa {SG_MAX} ký tự).\n"
@@ -1098,7 +1122,7 @@ def build_prompts():
 
 BC_MAX = 3500  # độ dài tối đa 1 thông báo (khớp giới hạn của sunviw)
 build_prompts()
-PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "bc": "adm"}
+PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "bc": "adm", "cm_find": "adm:cm", "cm_add": "adm:cm", "cm_sub": "adm:cm"}
 
 # ============================== GỬI / SỬA TIN NHẮN ==============================
 
@@ -1989,6 +2013,10 @@ def prompt_of(st):
         gm = db.execute("SELECT name FROM games WHERE code=?", (st["game"],)).fetchone()
         if gm:
             t = t.replace(LINE + "\n", LINE + f"\n🎮 Game: <b>{esc(gm['name'])}</b>\n", 1)
+    if st["type"] in ("cm_add", "cm_sub") and st.get("target"):  # admin chính đang nhập số tiền cộng / trừ cho 1 khách
+        tu = reload_user(st["target"])
+        if tu:
+            t = t.replace(LINE + "\n", LINE + f"\n👤 Khách: <b>{esc(tu['name'])}</b> · <code>{tu['id']}</code>\n💲 Số dư: <b>{money(tu['balance'])}</b>\n", 1)
     return t
 
 
@@ -2139,6 +2167,8 @@ async def route(q, ctx, data):
     user = get_user(q.from_user)
     uid = user["id"]
     ctx.user_data.pop("await", None)
+    if user["banned"] and not is_admin(uid):  # tài khoản bị admin chính khóa
+        return "⛔ Tài khoản của bạn đã bị khóa. Vui lòng liên hệ CSKH."
 
     if data == "home":
         await refresh_keys(uid, timeout=3)
@@ -2466,6 +2496,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     user = get_user(m.from_user)
     uid, chat, mid = user["id"], st["chat"], st["msg"]
+    if user["banned"] and not is_admin(uid):
+        return
     text = (m.text or "").strip()
     if st["type"] == "wiz":  # admin (có quyền) đang nhập chữ trong wizard tạo ưu đãi / gifcode
         w = ctx.user_data.get("wiz")
@@ -2489,6 +2521,52 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["bc_draft"] = text
         t, kb = bc_confirm(text)
         await edit_or_send(ctx.bot, chat, mid, t, kb)
+        return
+
+    if st["type"] == "cm_find":  # admin chính tìm khách
+        if not is_main(uid):
+            return
+        found = cm_search(text)
+        if not found:
+            return await err("⚠️ Không tìm thấy khách nào. Thử ID, @username hoặc tên khác.")
+        ctx.user_data.pop("await", None)
+        if len(found) == 1:
+            await refresh_keys(found[0]["id"], timeout=4)
+            t, kb = cm_card(found[0]["id"])
+        else:
+            t, kb = cm_found_screen(found)
+        await edit_or_send(ctx.bot, chat, mid, t, kb)
+        return
+    if st["type"] in ("cm_add", "cm_sub"):  # admin chính nhập số tiền cộng / trừ -> màn xác nhận
+        if not is_main(uid):
+            return
+        tid, sub = st.get("target"), st["type"] == "cm_sub"
+        tu = reload_user(tid) if tid else None
+        if not tu:
+            ctx.user_data.pop("await", None)
+            await edit_or_send(ctx.bot, chat, mid, "⚠️ Không tìm thấy khách này.", K([[B("⬅️ Quản lý khách", callback_data="adm:cm")]]))
+            return
+        amount = parse_amount(text)
+        if amount is None or amount < 1:
+            return await err("⚠️ <b>Số tiền không hợp lệ.</b> Hãy nhập lại, ví dụ <code>50000</code>.")
+        if amount > CM_ADJ_MAX:
+            return await err(f"⚠️ Tối đa <b>{money(CM_ADJ_MAX)}</b> mỗi lần. Hãy nhập lại.")
+        if sub and amount > tu["balance"]:
+            return await err(f"⚠️ Khách chỉ còn <b>{money(tu['balance'])}</b>, không trừ được {money(amount)}.")
+        ctx.user_data.pop("await", None)
+        delta = -amount if sub else amount
+        tok = cm_new_token(uid, tid, delta)
+        after = tu["balance"] + delta
+        await edit_or_send(
+            ctx.bot, chat, mid,
+            f"{'➖ TRỪ TIỀN' if sub else '➕ CỘNG TIỀN'} — <b>XÁC NHẬN</b>\n{LINE}\n"
+            f"👤 Khách: <b>{esc(tu['name'])}</b> · <code>{tid}</code>\n"
+            f"💲 Số dư hiện tại: <b>{money(tu['balance'])}</b>\n"
+            f"{'➖' if sub else '➕'} Số tiền: <b>{money(amount)}</b>\n"
+            f"💲 Số dư sau khi {'trừ' if sub else 'cộng'}: <b>{money(after)}</b>\n{LINE}\n"
+            f"<i>Khách sẽ nhận được thông báo và giao dịch ghi vào lịch sử số dư của họ.</i>",
+            K([[B("✅ Xác nhận", callback_data=f"adm:cmy:{tok}"), B("❌ Hủy", callback_data=f"adm:cmv:{tid}")]]),
+        )
         return
 
     if st["type"] == "amount":
@@ -2691,6 +2769,8 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not st or st["type"] not in ("fb_photo", "fb_text"):
         return
     user = get_user(m.from_user)
+    if user["banned"] and not is_admin(user["id"]):
+        return
     chat, mid = st["chat"], st["msg"]
     if doc:
         is_img = (doc.mime_type or "").lower() in FB_IMG_MIMES or (doc.file_name or "").lower().endswith(FB_IMG_EXTS)
@@ -3088,6 +3168,136 @@ def bc_confirm(text):
     return f"📢 <b>XEM TRƯỚC THÔNG BÁO</b>\n{LINE}\n{bc_message(text)}\n{LINE}\nSẽ gửi tới <b>{n}</b> khách. Xác nhận?", kb
 
 
+# ============================== NHẮC KEY SẮP HẾT HẠN ==============================
+# Job nền: hỏi sunviw hạn key của từng khách (cùng nguồn với nút "Game Đã Mua Key"). Key còn dưới ngưỡng (mặc định 24 giờ,
+# gói ngắn thì ngưỡng nhỏ hơn) -> nhắn khách ĐÚNG 1 LẦN / key kèm nút "Mua lại". Khách đã có key khác cùng game còn dài thì không nhắc.
+# Chỉ chạy khi bot đang liên lạc được với sunviw (để hạn chính xác). Tắt: EXPIRY_REMIND_HOURS=0 trong config.env.
+_exp_state = {}  # khách -> {"mid": id đơn key mới nhất đã xem, "next": lúc cần kiểm tra lại}
+
+
+def exp_threshold(it):
+    """Còn dưới số giây này thì nhắc: tối đa EXPIRY_REMIND; gói ngắn thì nhỏ hơn (key 1 ngày không bị nhắc ngay sau khi mua)."""
+    return min(EXPIRY_REMIND, max(3600, int((it["days"] or 0) * 86400 * 0.34)))
+
+
+def exp_pick(items):
+    """-> [(key, có_nhắc_không)] cho key đang chạy và còn dưới ngưỡng. Đã có key khác CÙNG GAME còn dài (khách gia hạn rồi) -> chỉ ghi nhận, không nhắc."""
+    out = []
+    for it in items:
+        if it["act"] is not True or it["left"] <= 0:
+            continue
+        thr = exp_threshold(it)
+        if it["left"] > thr:
+            continue
+        covered = any(o is not it and o["game"] == it["game"] and o["left"] > thr for o in items)
+        out.append((it, not covered))
+    return out
+
+
+def exp_next_check(items):
+    """Bao lâu nữa (giây) cần hỏi lại khách này: tới lúc key gần nhất chạm ngưỡng, tối đa 3 giờ; chưa rõ hạn thì 10 phút."""
+    nxt = 3 * 3600
+    for it in items:
+        if it["act"] is None:
+            return 600
+        if it["act"] is True and it["left"] > exp_threshold(it):
+            nxt = min(nxt, it["left"] - exp_threshold(it))
+    return max(300, nxt)
+
+
+def exp_candidates(now):
+    """Khách (không bị chặn / khóa) có đơn key hoàn tất trong 400 ngày gần đây + id đơn key mới nhất của họ."""
+    return db.execute(
+        "SELECT p.user_id, MAX(p.id) mid FROM purchases p JOIN users u ON u.id=p.user_id AND u.blocked=0 AND u.banned=0 "
+        "WHERE p.status='done' AND p.key_text IS NOT NULL AND p.key_text<>'' AND COALESCE(p.done,p.created,0)>? "
+        "GROUP BY p.user_id",
+        (now - 400 * 86400,),
+    ).fetchall()
+
+
+async def send_expiry_reminder(bot, uid, items):
+    """Nhắn khách các key sắp hết hạn kèm nút mua lại. -> True nếu xong (kể cả khách chặn bot), False nếu lỗi tạm thời (thử lại sau)."""
+    items = sorted(items, key=lambda x: x["left"])
+    names = {g["code"]: g["name"] for g in games_all()}
+    online = {g["code"] for g in games_online()}
+    blocks = [
+        f"🎮 <b>{esc(names.get(it['game'], it['game']))}</b> · ⏱ {pkg_label(it['pkg'])}\n"
+        f"🔑 <code>{esc(it['key'])}</code>\n"
+        f"📅 Hết hạn: <b>{fmt_dt(it['exp'])}</b> · ⏳ còn <b>{fmt_left(it['left'])}</b>"
+        for it in items[:5]
+    ]
+    more = f"\n<i>… và {len(items) - 5} key khác</i>" if len(items) > 5 else ""
+    text = (
+        f"⏰ <b>KEY SẮP HẾT HẠN</b>\n{LINE}\n" + f"\n{LINE}\n".join(blocks) + more
+        + f"\n{LINE}\nMua key mới trước khi hết hạn để không bị gián đoạn 👇"
+    )
+    rows, seen = [], set()
+    for it in items:
+        key = (it["game"], it["pkg"])
+        pk = db.execute("SELECT id, price FROM packages WHERE game=? AND code=?", key).fetchone()
+        if it["game"] in online and pk and key not in seen and len(seen) < 3:
+            seen.add(key)
+            price, _ = key_price(it["game"], it["pkg"], pk["price"])
+            rows.append([B(f"🔄 Mua lại {names.get(it['game'], it['game'])} · {pkg_label(it['pkg'])} · {money(price)}", callback_data=f"p:{pk['id']}")])
+    rows.append([B("🛒 Mua Key", callback_data="buy"), B("🏠 Trang chủ", callback_data="home")])
+    for attempt in (1, 2):
+        try:
+            await bot.send_message(uid, text, reply_markup=K(rows))
+            return True
+        except RetryAfter as e:
+            if attempt == 1:
+                await asyncio.sleep(_retry_secs(e) + 1)
+                continue
+            return False
+        except Forbidden:
+            db.execute("UPDATE users SET blocked=1 WHERE id=?", (uid,))
+            return True
+        except TelegramError as e:
+            log.warning("Nhắc hết hạn khách %s lỗi: %s", uid, e)
+            return False
+    return False
+
+
+async def expiry_tick(app):
+    if not EXPIRY_REMIND or not api_fresh():
+        return
+    now = time.time()
+    due = []
+    for r in exp_candidates(now):
+        st = _exp_state.get(r["user_id"])
+        if not st or st["mid"] != r["mid"] or st["next"] <= now:  # có đơn key mới, hoặc tới lúc kiểm tra lại
+            due.append(r)
+    for r in due[:EXPIRY_BATCH]:
+        uid = r["user_id"]
+        items = await refresh_keys(uid, force=True, timeout=8)
+        now = time.time()
+        _exp_state[uid] = {"mid": r["mid"], "next": now + exp_next_check(items)}
+        fresh = []
+        for it, notify in exp_pick(items):
+            added = db.execute(
+                "INSERT OR IGNORE INTO key_reminders(key_text,user_id,exp,at) VALUES(?,?,?,?)", (it["key"], uid, it["exp"], int(now))
+            ).rowcount
+            if added and notify:
+                fresh.append(it)
+        if fresh and not await send_expiry_reminder(app.bot, uid, fresh):
+            for it in fresh:  # gửi lỗi tạm thời -> bỏ ghi nhận để lượt sau nhắc lại
+                db.execute("DELETE FROM key_reminders WHERE key_text=?", (it["key"],))
+            _exp_state[uid]["next"] = now + 600
+        await asyncio.sleep(0.3)
+
+
+async def expiry_loop(app):
+    await asyncio.sleep(60)  # chờ bot đồng bộ xong với sunviw
+    while True:
+        try:
+            await expiry_tick(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Lỗi job nhắc key sắp hết hạn")
+        await asyncio.sleep(EXPIRY_TICK)
+
+
 async def post_init(app):
     if not api.ready:
         log.error("❌ %s — bot vẫn chạy nhưng KHÔNG bán được key.", api.why)
@@ -3095,6 +3305,11 @@ async def post_init(app):
         await sync_once(app)
     _loops.append(asyncio.ensure_future(sync_loop(app)))
     _loops.append(asyncio.ensure_future(purchase_recovery_loop(app)))
+    if EXPIRY_REMIND:
+        _loops.append(asyncio.ensure_future(expiry_loop(app)))
+        log.info("⏰ Nhắc khách key sắp hết hạn: BẬT (trước %sh)", EXPIRY_REMIND // 3600)
+    else:
+        log.info("⏰ Nhắc khách key sắp hết hạn: TẮT (EXPIRY_REMIND_HOURS=0)")
     if bank_ready():
         _loops.append(asyncio.ensure_future(bank_loop(app)))
         log.info("💳 Nạp tiền TỰ ĐỘNG qua API ngân hàng: BẬT (dò mỗi %ss)", BANK_POLL_SEC)
@@ -3149,7 +3364,7 @@ def admin_panel(uid):
         f"⏳ Chờ duyệt: <b>{n_ord}</b> đơn nạp · <b>{n_fb}</b> feedback\n"
         f"🔥 Ưu đãi đang chạy: <b>{len(active_promos())}</b>\n"
         f"🎁 Gifcode còn lượt: <b>{n_gift}</b>\n"
-        + (f"📮 Hòm thư: <b>{n_sg}</b> góp ý chưa đọc\n" if "feedback" in perms else "")
+        + (f"📮 Hòm thư: <b>{n_sg}</b> góp ý chưa đọc\n" if is_main(uid) else "")
         + (f"⚠️ Đơn key đang chờ sunviw: <b>{n_pur}</b>\n" if n_pur and is_main(uid) else "")
         + f"{LINE}\n"
     )
@@ -3167,8 +3382,8 @@ def admin_panel(uid):
         row.append(B("⏳ Chờ Duyệt", callback_data="adm:pending"))
     row.append(B("🎮 Trạng Thái Game", callback_data="adm:stock"))
     rows.append(row)
-    if "feedback" in perms:
-        rows.append([B(f"📮 Hòm Thư Góp Ý ({n_sg})" if n_sg else "📮 Hòm Thư Góp Ý", callback_data="adm:mail")])
+    if is_main(uid):  # Quản lý khách + Hòm thư góp ý: CHỈ admin chính thấy (admin phụ không có nút, bấm lén cũng bị chặn ở admin_route)
+        rows.append([B("👥 Quản Lý Khách", callback_data="adm:cm"), B(f"📮 Hòm Thư ({n_sg})" if n_sg else "📮 Hòm Thư", callback_data="adm:mail")])
     if "broadcast" in perms:
         rows.append([B("📢 Thông Báo Toàn Bot", callback_data="bc:go")])
     rows.append([B("📖 Lệnh Khác", callback_data="adm:help"), B("🏠 Trang chủ", callback_data="home")])
@@ -3552,7 +3767,7 @@ async def wiz_route(q, ctx, data, uid):
 
 
 # ============================== HÒM THƯ GÓP Ý ==============================
-# Khách bấm "📮 Góp Ý" ở trang chủ -> gõ chữ -> lưu bảng suggestions. Admin có quyền "feedback" đọc ở Bảng admin → "📮 Hòm Thư Góp Ý".
+# Khách bấm "📮 Góp Ý" ở trang chủ -> gõ chữ -> lưu bảng suggestions. CHỈ admin chính đọc ở Bảng admin → "📮 Hòm Thư".
 # Chưa đọc = read_at IS NULL; mở 1 góp ý là tự đánh dấu đã đọc.
 
 
@@ -3666,6 +3881,226 @@ async def mail_route(q, ctx, data, uid):
     await show(q, ctx, *scr)
 
 
+# ============================== QUẢN LÝ KHÁCH (CHỈ ADMIN CHÍNH) ==============================
+# Tìm khách theo ID / @username / tên · xem số dư, key còn hạn, giao dịch gần đây · cộng / trừ tiền (có bước xác nhận,
+# ghi vào lịch sử số dư của khách + báo cho khách) · khóa / mở khóa tài khoản (khách bị khóa không dùng được bot, không nhận nhắc hết hạn).
+CM_KINDS = {
+    "t": ("🏆 NẠP NHIỀU NHẤT", "WHERE total_deposit>0", "total_deposit DESC, id"),
+    "n": ("🆕 KHÁCH MỚI", "", "created DESC, id DESC"),
+    "b": ("🚫 KHÁCH BỊ KHÓA", "WHERE banned=1", "id DESC"),
+}
+_cm_tok = {}  # mã xác nhận cộng / trừ tiền dùng 1 lần: mã -> (admin, khách, số tiền ±, hết hạn)
+
+
+def cm_new_token(admin, tid, delta):
+    now = time.time()
+    for k in [k for k, v in _cm_tok.items() if v[3] < now]:
+        _cm_tok.pop(k, None)
+    tok = secrets.token_hex(4)
+    _cm_tok[tok] = (admin, tid, delta, now + 600)
+    return tok
+
+
+def cm_search(q):
+    """ID chính xác -> @username chính xác -> một phần tên / username (tối đa 8 khách)."""
+    q = (q or "").strip()
+    if not q:
+        return []
+    if re.fullmatch(r"-?\d{1,15}", q):
+        r = db.execute("SELECT * FROM users WHERE id=?", (int(q),)).fetchall()
+        if r:
+            return r
+    r = db.execute("SELECT * FROM users WHERE LOWER(username)=LOWER(?)", (q.lstrip("@"),)).fetchall()
+    if r:
+        return r
+    like = "%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    return db.execute(
+        "SELECT * FROM users WHERE name LIKE ? ESCAPE '\\' OR username LIKE ? ESCAPE '\\' ORDER BY total_deposit DESC LIMIT 8",
+        (like, like),
+    ).fetchall()
+
+
+def cm_home_screen():
+    now = int(time.time())
+    r = db.execute(
+        "SELECT COUNT(*) n, COALESCE(SUM(balance),0) bal, COALESCE(SUM(total_deposit),0) dep, COALESCE(SUM(banned),0) bn FROM users"
+    ).fetchone()
+    new24 = db.execute("SELECT COUNT(*) FROM users WHERE created>?", (now - 86400,)).fetchone()[0]
+    text = (
+        f"👥 <b>QUẢN LÝ KHÁCH</b>\n{LINE}\n"
+        f"👤 Tổng khách: <b>{r['n']}</b> · mới 24h: <b>{new24}</b>\n"
+        f"💲 Tổng số dư khách đang giữ: <b>{money(r['bal'])}</b>\n"
+        f"📥 Tổng khách đã nạp: <b>{money(r['dep'])}</b>\n"
+        f"🚫 Đang bị khóa: <b>{r['bn']}</b>\n{LINE}\n"
+        f"Chọn cách tìm khách 👇"
+    )
+    kb = K(
+        [
+            [B("🔎 Tìm khách (ID / @user / tên)", callback_data="adm:cmf")],
+            [B("🏆 Nạp nhiều", callback_data="adm:cml:t:0"), B("🆕 Khách mới", callback_data="adm:cml:n:0")],
+            [B("🚫 Bị khóa", callback_data="adm:cml:b:0")],
+            [B("⬅️ Bảng admin", callback_data="adm")],
+        ]
+    )
+    return text, kb
+
+
+def cm_user_lines(rows):
+    out, btns = [], []
+    for u in rows:
+        flag = "🚫 " if u["banned"] else ""
+        out.append(f"{flag}👤 <b>{esc(u['name'])}</b> · <code>{u['id']}</code>\n      💲 {money(u['balance'])} · 📥 {money(u['total_deposit'])}")
+        btns.append([B(f"{flag}{(u['name'] or 'Khách')[:20]} · {u['id']}", callback_data=f"adm:cmv:{u['id']}")])
+    return out, btns
+
+
+def cm_list_screen(kind="t", page=0):
+    kind = kind if kind in CM_KINDS else "t"
+    title, where, order = CM_KINDS[kind]
+    n = db.execute(f"SELECT COUNT(*) FROM users {where}").fetchone()[0]
+    pages = max(1, -(-n // CM_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    rows = db.execute(f"SELECT * FROM users {where} ORDER BY {order} LIMIT ? OFFSET ?", (CM_PER_PAGE, page * CM_PER_PAGE)).fetchall()
+    out, btns = cm_user_lines(rows)
+    body = "\n".join(out) if out else "<i>Không có khách nào.</i>"
+    text = f"{title}\n{LINE}\n{body}\n{LINE}\n<i>Trang {page + 1}/{pages} · {n} khách. Bấm tên để mở hồ sơ.</i>"
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(B("◀️ Trước", callback_data=f"adm:cml:{kind}:{page - 1}"))
+        nav.append(B(f"{page + 1}/{pages}", callback_data=f"adm:cml:{kind}:{page}"))
+        if page < pages - 1:
+            nav.append(B("Sau ▶️", callback_data=f"adm:cml:{kind}:{page + 1}"))
+        btns.append(nav)
+    btns.append([B("⬅️ Quản lý khách", callback_data="adm:cm")])
+    return text, K(btns)
+
+
+def cm_found_screen(found):
+    out, btns = cm_user_lines(found)
+    btns.append([B("🔎 Tìm lại", callback_data="adm:cmf"), B("⬅️ Quản lý khách", callback_data="adm:cm")])
+    return f"🔎 <b>KẾT QUẢ TÌM KHÁCH</b>\n{LINE}\n" + "\n".join(out) + f"\n{LINE}\n<i>Bấm tên để mở hồ sơ.</i>", K(btns)
+
+
+def _left_txt(it):
+    if it["act"] is True:
+        return f"còn {fmt_left(it['left'])}"
+    return "chưa kích hoạt" if it["act"] is False else f"{it['days']} ngày (tính từ lần dùng đầu)"
+
+
+def cm_card(tid):
+    """Hồ sơ 1 khách (None nếu không có). Key còn hạn đọc từ cache — gọi refresh_keys trước để có hạn mới nhất."""
+    u = reload_user(tid)
+    if not u:
+        return None
+    n_keys = db.execute("SELECT COUNT(*) FROM logs WHERE user_id=? AND kind='key'", (tid,)).fetchone()[0]
+    its = sorted(key_view(tid), key=lambda x: x["left"])
+    games = {g["code"]: g["name"] for g in games_all()}
+    flags = ("🚫 <b>TÀI KHOẢN ĐANG BỊ KHÓA</b>\n" if u["banned"] else "") + ("📵 Khách đã chặn bot (không nhận được tin nhắn)\n" if u["blocked"] else "")
+    keys_txt = "\n".join(
+        f"   • {esc(games.get(it['game'], it['game']))} · {pkg_label(it['pkg'])} · {_left_txt(it)}" for it in its[:6]
+    ) or "   <i>Không có key còn hạn</i>"
+    logs = db.execute("SELECT * FROM logs WHERE user_id=? ORDER BY id DESC LIMIT 5", (tid,)).fetchall()
+    recent = "\n".join(hist_line("log", r) for r in logs) or "<i>Chưa có giao dịch.</i>"
+    uname = f" (@{esc(u['username'])})" if u["username"] else ""
+    text = (
+        f"👤 <b>HỒ SƠ KHÁCH</b>\n{LINE}\n{flags}"
+        f"👤 <b>{esc(u['name'])}</b>{uname}\n"
+        f"🆔 <code>{tid}</code>\n"
+        f"📅 Tham gia: <b>{fmt_dt(u['created']) if u['created'] else '—'}</b>\n"
+        f"💲 Số dư: <b>{money(u['balance'])}</b>\n"
+        f"📥 Tổng nạp: <b>{money(u['total_deposit'])}</b>\n"
+        f"🔑 Key đã mua: <b>{n_keys}</b> · còn hạn: <b>{len(its)}</b>\n{keys_txt}\n{LINE}\n"
+        f"🧾 <b>Giao dịch gần đây</b>\n{recent}"
+    )
+    url = f"https://t.me/{u['username']}" if u["username"] else f"tg://user?id={tid}"
+    row2 = []
+    if not is_admin(tid):  # không khóa admin
+        row2.append(B("✅ Mở khóa" if u["banned"] else "🚫 Khóa tài khoản", callback_data=f"adm:cmb:{tid}"))
+    row2.append(B("💬 Mở chat", url=url))
+    kb = K(
+        [
+            [B("➕ Cộng tiền", callback_data=f"adm:cma:{tid}"), B("➖ Trừ tiền", callback_data=f"adm:cms:{tid}")],
+            row2,
+            [B("⬅️ Quản lý khách", callback_data="adm:cm")],
+        ]
+    )
+    return text, kb
+
+
+async def cm_route(q, ctx, data, uid):
+    """adm:cm · adm:cml:<t|n|b>:<trang> · adm:cmf (tìm) · adm:cmv:<id> (hồ sơ) · adm:cma|cms:<id> (nhập số tiền cộng | trừ)
+    · adm:cmy:<mã> (xác nhận) · adm:cmb:<id> (khóa / mở khóa). Quyền (chỉ admin chính) đã kiểm tra ở admin_route."""
+    p = data.split(":")
+    cmd = p[1]
+    if cmd == "cm":
+        await show(q, ctx, *cm_home_screen())
+        return
+    if cmd == "cml":
+        kind = p[2] if len(p) > 2 else "t"
+        page = int(p[3]) if len(p) > 3 and p[3].isdigit() else 0
+        await show(q, ctx, *cm_list_screen(kind, page))
+        return
+    if cmd == "cmf":
+        await start_prompt(q, ctx, "cm_find", "adm:cm")
+        return
+    if cmd == "cmy":  # xác nhận cộng / trừ tiền (mã dùng 1 lần)
+        v = _cm_tok.pop(p[2] if len(p) > 2 else "", None)
+        if not v or v[3] < time.time() or v[0] != uid:
+            await show(q, ctx, *cm_home_screen())
+            return "Yêu cầu đã hết hạn hoặc đã được xử lý rồi."
+        _, tid, delta, _ = v
+        with tx() as c:
+            ok = (
+                c.execute("UPDATE users SET balance=balance+? WHERE id=?", (delta, tid)).rowcount
+                if delta > 0
+                else c.execute("UPDATE users SET balance=balance-? WHERE id=? AND balance>=?", (-delta, tid, -delta)).rowcount
+            )
+            if ok:
+                add_log(c, tid, "adj", "Admin cộng tiền" if delta > 0 else "Admin trừ tiền", str(uid), delta)
+        if not ok:
+            scr = cm_card(tid)
+            await show(q, ctx, *(scr or cm_home_screen()))
+            return "⚠️ Không thực hiện được (số dư khách đã thay đổi hoặc không còn khách này)."
+        tu = reload_user(tid)
+        try:
+            await ctx.bot.send_message(
+                tid,
+                f"🛠 <b>SỐ DƯ ĐƯỢC ĐIỀU CHỈNH</b>\n{LINE}\n"
+                f"Admin vừa {'cộng' if delta > 0 else 'trừ'} <b>{money(abs(delta))}</b> {'vào' if delta > 0 else 'khỏi'} số dư của bạn.\n"
+                f"💲 Số dư hiện tại: <b>{money(tu['balance'])}</b>",
+                reply_markup=back_home_kb(),
+            )
+        except TelegramError:
+            pass  # khách đã chặn bot -> không nhắn được, tiền vẫn đã điều chỉnh
+        await show(q, ctx, *cm_card(tid))
+        return f"~✅ Đã {'cộng' if delta > 0 else 'trừ'} {money(abs(delta))}."
+    tid = int(p[2]) if len(p) > 2 and re.fullmatch(r"-?\d+", p[2]) else 0
+    if cmd == "cmv":
+        await refresh_keys(tid, timeout=4)
+        scr = cm_card(tid)
+        if not scr:
+            await show(q, ctx, *cm_home_screen())
+            return "Không tìm thấy khách này."
+        await show(q, ctx, *scr)
+        return
+    if cmd in ("cma", "cms"):
+        if not reload_user(tid):
+            return "Không tìm thấy khách này."
+        await start_prompt(q, ctx, "cm_add" if cmd == "cma" else "cm_sub", f"adm:cmv:{tid}", target=tid)
+        return
+    if cmd == "cmb":
+        t = reload_user(tid)
+        if not t:
+            return "Không tìm thấy khách này."
+        if is_admin(tid):
+            return "⛔ Không thể khóa tài khoản admin."
+        new = 0 if t["banned"] else 1
+        db.execute("UPDATE users SET banned=? WHERE id=?", (new, tid))
+        await show(q, ctx, *cm_card(tid))
+        return "~🚫 Đã khóa tài khoản này." if new else "~✅ Đã mở khóa tài khoản này."
+
+
 async def admin_route(q, ctx, data, uid):
     chat = q.message.chat_id
     if data == "adm":
@@ -3685,9 +4120,11 @@ async def admin_route(q, ctx, data, uid):
     if data == "adm:help":
         await show(q, ctx, admin_help(uid), back)
         return
-    if data.startswith(("adm:mail", "adm:mv:", "adm:md:", "adm:mra")):  # hòm thư góp ý
-        if not has_perm(uid, "feedback"):
-            return "⛔ Bạn chưa được cấp quyền đọc hòm thư góp ý."
+    if data.startswith(("adm:mail", "adm:mv:", "adm:md:", "adm:mra", "adm:cm")):  # hòm thư góp ý + quản lý khách: CHỈ admin chính
+        if not is_main(uid):
+            return "⛔ Mục này chỉ dành cho admin chính."
+        if data.startswith("adm:cm"):
+            return await cm_route(q, ctx, data, uid)
         return await mail_route(q, ctx, data, uid)
     if data.startswith("aw:"):  # wizard: quyền kiểm tra theo loại (promo / gift) trong wiz_route
         return await wiz_route(q, ctx, data, uid)
@@ -3720,6 +4157,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.pop("await", None)
     u = get_user(update.effective_user)
     await safe_delete(update.message)
+    if u["banned"] and not is_admin(u["id"]):  # tài khoản bị admin chính khóa
+        url = cskh_url()
+        await ctx.bot.send_message(
+            update.effective_chat.id,
+            f"⛔ <b>Tài khoản của bạn đã bị khóa.</b>\nVui lòng liên hệ CSKH để được hỗ trợ.",
+            reply_markup=K([[B("🎧 CSKH", url=url)]]) if url else None,
+        )
+        return
     await refresh_keys(u["id"], timeout=3)
     text, kb = home_screen(u)
     await ctx.bot.send_message(update.effective_chat.id, text, reply_markup=kb)
@@ -3750,8 +4195,8 @@ def admin_help(uid):
         out.append("<code>/promo</code>  xem danh sách ưu đãi")
     if perms & {"deposit", "feedback"}:
         out.append("<code>/pending</code>  xem đơn nạp &amp; feedback đang chờ duyệt")
-    if "feedback" in perms:
-        out.append("📮 <b>Hòm thư góp ý</b>: <code>/admin</code> → <b>📮 Hòm Thư Góp Ý</b> (xem · đánh dấu đã đọc · xóa · nhắn khách)")
+    if is_main(uid):
+        out.append("👥 <b>Quản lý khách</b> · 📮 <b>Hòm thư góp ý</b>: <code>/admin</code> → nút tương ứng (chỉ admin chính thấy)")
     if "broadcast" in perms:
         out.append("<code>/broadcast Nội dung</code>  gửi thông báo tới TẤT CẢ khách (có xem trước + xác nhận)")
     out.append("<code>/id</code>  xem ID của bạn / ID của chat (gõ trong box để lấy ID box)")
