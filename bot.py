@@ -115,6 +115,7 @@ SG_MAX = 1000  # độ dài tối đa 1 góp ý (gửi riêng cho admin, vào h�
 SG_COOLDOWN = 30  # giây tối thiểu giữa 2 lần gửi góp ý của cùng 1 khách
 SG_PER_DAY = 10  # số góp ý tối đa / khách / 24 giờ
 MAIL_PER_PAGE = 5  # số góp ý mỗi trang trong hòm thư admin
+SG_REPLY_MAX = 1000  # độ dài tối đa 1 tin admin trả lời góp ý (gửi riêng cho đúng khách đã góp ý)
 _exp_h = os.getenv("EXPIRY_REMIND_HOURS", "24").strip()
 EXPIRY_REMIND = (int(_exp_h) if re.fullmatch(r"\d+", _exp_h) else 24) * 3600  # nhắc khách khi key còn dưới N giờ (0 = tắt nhắc)
 EXPIRY_TICK = 300  # giây giữa 2 lượt quét nhắc hết hạn
@@ -301,6 +302,7 @@ _ensure_cols("feedback", {"game": "TEXT"})  # game khách chọn khi gửi feedb
 _ensure_cols("feedback", {"photos": "TEXT", "album": "TEXT"})  # photos = JSON list file_id (nhiều ảnh); album = JSON list message_id album ở chat khách (để xóa)
 _ensure_cols("users", {"blocked": "INTEGER NOT NULL DEFAULT 0"})  # khách đã chặn bot -> broadcast bỏ qua
 _ensure_cols("users", {"banned": "INTEGER NOT NULL DEFAULT 0"})  # admin chính khóa tài khoản khách (không dùng được bot)
+_ensure_cols("suggestions", {"reply": "TEXT", "replied_by": "INTEGER", "replied_at": "INTEGER"})  # admin trả lời góp ý (gửi riêng cho khách đó)
 
 
 # ============================== TIỆN ÍCH ==============================
@@ -613,7 +615,8 @@ GIFT_USAGE = (
     "<code>/gifcode keyflat 5000 [lượt] [MÃ]</code>  giảm 5.000đ giá key\n"
     "<code>/gifcode money 50000 [lượt] [MÃ]</code>  tặng tiền vào số dư\n"
     "<code>/gifcode key lc79 30d [lượt] [MÃ]</code>  tặng 1 key (sunviw sinh key)\n"
-    "<i>lượt = số lượng được nhập (mặc định 1). Hoặc dùng nút trong /admin → Tạo Gifcode.</i>"
+    "<i>lượt = số lượng được nhập (mặc định 1). Hoặc dùng nút trong /admin → Tạo Gifcode.\n"
+    "Thêm <code>box</code> ở CUỐI lệnh để đăng gifcode lên box, vd: <code>/gifcode money 50000 10 box</code></i>"
 )
 
 
@@ -799,6 +802,19 @@ def purchase_box_text(name, gname, label):
         f"👤 <b>{esc(mask_user(name))}</b> vừa mua key\n"
         f"🎮 Game: <b>{esc(gname)}</b> · {label}\n"
         f"🕐 {fmt_time(time.time())}"
+    )
+
+
+def gift_box_text(g, bot_user=None):
+    """Tin công khai khi admin chọn đăng gifcode lên box. CÓ chứa mã (để mọi người cùng nhập)."""
+    where = f"<b>@{esc(bot_user)}</b>" if bot_user else "bot"
+    return (
+        f"🎁 <b>GIFCODE MỚI</b>\n{LINE}\n"
+        f"🎟 Mã: <code>{esc(g['code'])}</code>\n"
+        f"{gift_reward_text(g)}\n"
+        f"🔢 Số lượng: <b>{g['max_uses']}</b> lượt (mỗi khách nhập 1 lần)\n{LINE}\n"
+        f"👉 Vào {where} → <b>Nạp Tiền</b> hoặc <b>Mua Key</b> → 🎁 <b>Nhập Gifcode</b>\n"
+        f"⚡ Số lượng có hạn, nhập sớm nhé!"
     )
 
 
@@ -1111,6 +1127,12 @@ def build_prompts():
                 f"Góp ý được gửi <b>riêng cho admin</b>, không đăng công khai.\n\n"
                 f"<i>Ví dụ: muốn thêm game, báo lỗi, góp ý về giá / giao diện / hỗ trợ...</i>"
             ),
+            "sg_reply": (
+                f"✉️ <b>TRẢ LỜI GÓP Ý</b>\n{LINE}\n"
+                f"✍️ Gõ nội dung trả lời rồi gửi vào đây (chữ thuần, tối đa {SG_REPLY_MAX} ký tự).\n"
+                f"Tin này chỉ gửi <b>riêng cho khách đã góp ý</b>, không ai khác nhận được. "
+                f"Bạn sẽ xem trước và xác nhận trước khi gửi."
+            ),
             "bc": (
                 f"📢 <b>THÔNG BÁO TOÀN BOT</b>\n{LINE}\n"
                 f"Gõ nội dung thông báo rồi gửi vào đây (chữ thuần, tối đa {BC_MAX} ký tự). "
@@ -1122,7 +1144,7 @@ def build_prompts():
 
 BC_MAX = 3500  # độ dài tối đa 1 thông báo (khớp giới hạn của sunviw)
 build_prompts()
-PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "bc": "adm", "cm_find": "adm:cm", "cm_add": "adm:cm", "cm_sub": "adm:cm"}
+PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "sg_reply": "adm:mail", "bc": "adm", "cm_find": "adm:cm", "cm_add": "adm:cm", "cm_sub": "adm:cm"}
 
 # ============================== GỬI / SỬA TIN NHẮN ==============================
 
@@ -2017,6 +2039,16 @@ def prompt_of(st):
         tu = reload_user(st["target"])
         if tu:
             t = t.replace(LINE + "\n", LINE + f"\n👤 Khách: <b>{esc(tu['name'])}</b> · <code>{tu['id']}</code>\n💲 Số dư: <b>{money(tu['balance'])}</b>\n", 1)
+    if st["type"] == "sg_reply" and st.get("sid"):  # admin chính đang soạn trả lời 1 góp ý: nhắc lại góp ý đó
+        sr = db.execute(
+            "SELECT s.text, u.name FROM suggestions s LEFT JOIN users u ON u.id=s.user_id WHERE s.id=?", (st["sid"],)
+        ).fetchone()
+        if sr:
+            t = t.replace(
+                LINE + "\n",
+                LINE + f"\n👤 Gửi riêng cho: <b>{esc(sr['name'] or 'Khách')}</b>\n💭 Góp ý: <i>{mail_snip(sr['text'], 300)}</i>\n\n",
+                1,
+            )
     return t
 
 
@@ -2521,6 +2553,22 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data["bc_draft"] = text
         t, kb = bc_confirm(text)
         await edit_or_send(ctx.bot, chat, mid, t, kb)
+        return
+
+    if st["type"] == "sg_reply":  # admin chính soạn trả lời 1 góp ý -> xem trước -> xác nhận (chỉ gửi cho đúng khách đó)
+        if not is_main(uid):
+            return
+        if not text:
+            return await err("⚠️ Hãy gõ nội dung trả lời bằng chữ.")
+        if len(text) > SG_REPLY_MAX:
+            return await err(f"⚠️ Quá dài ({len(text)}/{SG_REPLY_MAX} ký tự). Hãy rút gọn.")
+        scr = sg_reply_confirm(st.get("sid"), text, st.get("flt", "n"), st.get("page", 0))
+        ctx.user_data.pop("await", None)
+        if not scr:
+            await edit_or_send(ctx.bot, chat, mid, "⚠️ Góp ý này không còn trong hòm thư.", K([[B("⬅️ Hòm thư", callback_data="adm:mail")]]))
+            return
+        ctx.user_data["sg_draft"] = {"sid": st["sid"], "text": text}
+        await edit_or_send(ctx.bot, chat, mid, *scr)
         return
 
     if st["type"] == "cm_find":  # admin chính tìm khách
@@ -3339,14 +3387,14 @@ WIZ_VALUE_PROMPT = {
     "dep_pct": "Nhập <b>% tặng thêm</b> trên giá trị nạp (1–200). Ví dụ: <code>10</code>",
     "money": "Nhập <b>số tiền tặng</b> vào số dư. Ví dụ: <code>50000</code> hoặc <code>50k</code>",
 }
-WIZ_ORDER = ["k", "value", "game", "pkg", "min", "secs", "uses"]  # thứ tự các lựa chọn (lùi bước thì xóa từ đó trở đi)
+WIZ_ORDER = ["k", "value", "game", "pkg", "min", "secs", "uses", "box"]  # thứ tự các lựa chọn (lùi bước thì xóa từ đó trở đi)
 WIZ_FIRST_KEY = {
     "pgroup": "k", "ptype": "k", "gtype": "k", "value": "value", "game": "game", "pkg": "pkg",
-    "min": "min", "min_c": "min", "dur": "secs", "dur_c": "secs", "uses": "uses", "uses_c": "uses",
+    "min": "min", "min_c": "min", "dur": "secs", "dur_c": "secs", "uses": "uses", "uses_c": "uses", "box": "box",
 }
 WIZ_CMD_STEP = {  # nút nào chỉ có tác dụng ở bước nào (chặn bấm nhầm nút của tin cũ)
     "pg": ("pgroup",), "t": ("ptype", "gtype"), "g": ("game",), "k": ("pkg",), "m": ("min",), "mc": ("min",),
-    "d": ("dur",), "dc": ("dur",), "u": ("uses",), "uc": ("uses",), "cc": ("confirm",), "ok": ("confirm",),
+    "d": ("dur",), "dc": ("dur",), "u": ("uses",), "uc": ("uses",), "x": ("box",), "cc": ("confirm",), "ok": ("confirm",),
 }
 
 
@@ -3473,6 +3521,8 @@ def wiz_lines(w):
         out.append("• Thời hạn: <b>" + (fmt_span(w["secs"]) if w["secs"] else "không giới hạn") + "</b>")
     if w.get("uses"):
         out.append(f"• Số lượng nhập: <b>{w['uses']}</b> lượt")
+    if "box" in w:
+        out.append("• Đăng gifcode lên box: <b>" + ("có" if w["box"] else "không") + "</b>")
     return "\n".join(out) + "\n\n" if out else ""
 
 
@@ -3562,6 +3612,26 @@ def wiz_render(ctx, chat, mid, uid=None):
         return head + "<b>Số lượng</b>: gifcode cho nhập tối đa bao nhiêu lần? (mỗi khách chỉ nhập 1 lần / mã) 👇", K(rows + [nav])
     if step == "uses_c":
         return ask("Nhập số lượng được nhập (1 – 100000). Ví dụ: <code>30</code>")
+    if step == "box":
+        warn = (
+            ""
+            if NOTIFY_CHAT is not None
+            else "\n\n⚠️ <i>Chưa cấu hình box (FEEDBACK_CHAT_ID / NOTIFY_CHAT_ID) — nếu chọn đăng thì bot cũng chưa đăng được.</i>"
+        )
+        return (
+            head
+            + "Có <b>đăng gifcode này lên box</b> không?\n"
+            + "<i>Đăng: mã hiện công khai trong box để mọi người cùng nhập (tối đa theo số lượng bạn đặt).\n"
+            + "Không đăng: bot chỉ tạo mã, bạn tự gửi riêng cho ai muốn tặng.</i>"
+            + warn,
+            K(
+                [
+                    [B("📢 Đăng lên box", callback_data="aw:x:1")],
+                    [B("🔒 Không đăng", callback_data="aw:x:0")],
+                    nav,
+                ]
+            ),
+        )
     if step == "code_c":
         return ask("Nhập mã gifcode riêng (4–20 ký tự: chữ, số, <code>-</code> hoặc <code>_</code>). Ví dụ: <code>TET2026</code>")
     # confirm
@@ -3645,9 +3715,14 @@ def wiz_apply(ctx, w, cmd, arg):
         if not arg.isdigit() or not 1 <= int(arg) <= 100000:
             return "Lựa chọn không hợp lệ."
         w["uses"] = int(arg)
-        wiz_go(ctx, "confirm")
+        wiz_go(ctx, "box")
     elif cmd == "uc":
         wiz_go(ctx, "uses_c")
+    elif cmd == "x":  # chọn có đăng gifcode lên box hay không
+        if arg not in ("0", "1"):
+            return "Lựa chọn không hợp lệ."
+        w["box"] = arg == "1"
+        wiz_go(ctx, "confirm")
     elif cmd == "cc":
         wiz_go(ctx, "code_c")
 
@@ -3681,7 +3756,7 @@ async def wiz_text(ctx, st, text):
             w["secs"], nxt = v, "confirm"
     elif step == "uses_c":
         if re.fullmatch(r"[0-9]{1,6}", text) and 1 <= int(text) <= 100000:
-            w["uses"], nxt = int(text), "confirm"
+            w["uses"], nxt = int(text), "box"
         else:
             err = "⚠️ <b>Số lượng không hợp lệ.</b> Nhập số từ 1 đến 100000."
     elif step == "code_c":
@@ -3723,12 +3798,22 @@ async def wiz_finish(q, ctx, w, uid):
         if not g:
             return "❌ Mã này đã tồn tại. Bấm ✏️ Đặt mã riêng để đổi mã khác."
         ctx.user_data.pop("wiz", None)
+        if w.get("box"):  # admin chọn đăng gifcode lên box (đăng xong mới báo kết quả)
+            posted = await post_box(ctx.bot, gift_box_text(g, await bot_username(ctx.bot)))
+            note = (
+                "📢 Đã đăng gifcode lên box."
+                if posted
+                else "⚠️ Chưa đăng được lên box (chưa cấu hình FEEDBACK_CHAT_ID / NOTIFY_CHAT_ID, hoặc bot chưa có quyền gửi tin). Bạn tự gửi mã cho khách nhé."
+            )
+        else:
+            note = "🔒 Không đăng lên box — bạn tự gửi mã cho khách."
         text = (
             f"🎁 <b>ĐÃ TẠO GIFCODE</b>\n{LINE}\n"
             f"🎟 Mã: <code>{esc(g['code'])}</code>\n"
             f"Phần thưởng: {gift_reward_text(g)}\n"
-            f"🔢 Số lượng nhập: <b>{g['max_uses']}</b> lượt\n\n"
-            f"<i>Chạm vào mã để sao chép rồi gửi cho khách.\nKhách nhập ở mục Nạp Tiền / Mua Key → 🎁 Nhập Gifcode.</i>"
+            f"🔢 Số lượng nhập: <b>{g['max_uses']}</b> lượt\n"
+            f"{note}\n\n"
+            f"<i>Chạm vào mã để sao chép.\nKhách nhập ở mục Nạp Tiền / Mua Key → 🎁 Nhập Gifcode.</i>"
         )
         kb = K([[B("🎁 Tạo thêm", callback_data="aw:gift"), B("🛠 Bảng admin", callback_data="adm")]])
     await show(q, ctx, text, kb)
@@ -3789,21 +3874,22 @@ def mail_list_screen(flt="n", page=0):
     page = min(max(page, 0), pages - 1)
     where = "WHERE s.read_at IS NULL" if flt == "n" else ""
     rows = db.execute(
-        "SELECT s.id, s.user_id, s.text, s.at, s.read_at, u.name FROM suggestions s "
+        "SELECT s.id, s.user_id, s.text, s.at, s.read_at, s.replied_at, u.name FROM suggestions s "
         f"LEFT JOIN users u ON u.id=s.user_id {where} ORDER BY s.id DESC LIMIT ? OFFSET ?",
         (MAIL_PER_PAGE, page * MAIL_PER_PAGE),
     ).fetchall()
     out, btns = [], []
     for r in rows:
         mark = "⚪" if r["read_at"] else "🔵"
-        out.append(f"{mark} <code>#{r['id']}</code> <b>{esc(r['name'] or 'Khách')}</b> · {fmt_time(r['at'])}\n      {mail_snip(r['text'])}")
-        btns.append(B(f"{mark} #{r['id']}", callback_data=f"adm:mv:{r['id']}:{flt}:{page}"))
+        rep = " ↩️" if r["replied_at"] else ""
+        out.append(f"{mark} <code>#{r['id']}</code>{rep} <b>{esc(r['name'] or 'Khách')}</b> · {fmt_time(r['at'])}\n      {mail_snip(r['text'])}")
+        btns.append(B(f"{mark} #{r['id']}{rep}", callback_data=f"adm:mv:{r['id']}:{flt}:{page}"))
     body = "\n".join(out) if out else ("<i>Không có góp ý chưa đọc 🎉</i>" if flt == "n" else "<i>Hòm thư đang trống.</i>")
     text = (
         f"📮 <b>HÒM THƯ GÓP Ý</b>\n{LINE}\n"
         f"📬 Chưa đọc: <b>{unread}</b> · Tổng: <b>{total}</b>\n{LINE}\n"
         f"{body}\n{LINE}\n"
-        f"🔵 chưa đọc · ⚪ đã đọc · <i>Bấm số góp ý để đọc đầy đủ</i>"
+        f"🔵 chưa đọc · ⚪ đã đọc · ↩️ đã trả lời · <i>Bấm số góp ý để đọc &amp; trả lời</i>"
     )
     kb = [btns[i : i + 3] for i in range(0, len(btns), 3)]
     kb.append(
@@ -3841,18 +3927,52 @@ def mail_view_screen(sid, flt="n", page=0):
         f"🕐 {fmt_time(r['at'])}\n{LINE}\n"
         f"{esc(r['text'])}"
     )
+    if r["replied_at"]:  # góp ý đã được trả lời -> hiện lại nội dung đã gửi cho khách
+        text += f"\n{LINE}\n↩️ <b>Đã trả lời</b> · {fmt_time(r['replied_at'])}\n{esc(r['reply'])}"
     url = f"https://t.me/{r['username']}" if r["username"] else f"tg://user?id={r['user_id']}"
     kb = K(
         [
-            [B("💬 Nhắn khách", url=url)],
+            [B("✉️ Trả lời lại" if r["replied_at"] else "✉️ Trả lời", callback_data=f"adm:mr:{sid}:{flt}:{page}"), B("💬 Nhắn khách", url=url)],
             [B("🗑 Xóa", callback_data=f"adm:md:{sid}:{flt}:{page}"), B("⬅️ Hòm thư", callback_data=f"adm:mail:{flt}:{page}")],
         ]
     )
     return text, kb
 
 
+def sg_reply_message(orig, reply):
+    """Tin gửi cho khách khi admin trả lời góp ý (kèm nhắc lại góp ý của họ)."""
+    return (
+        f"📮 <b>ADMIN ĐÃ TRẢ LỜI GÓP Ý CỦA BẠN</b>\n{LINE}\n"
+        f"💭 <b>Góp ý của bạn:</b>\n<i>{mail_snip(orig, 200)}</i>\n{LINE}\n"
+        f"💬 <b>Phản hồi:</b>\n{esc(reply)}"
+    )
+
+
+def sg_reply_confirm(sid, reply, flt="n", page=0):
+    """Màn xem trước + xác nhận trước khi gửi trả lời (None nếu góp ý không còn)."""
+    r = db.execute(
+        "SELECT s.text, s.user_id, u.name FROM suggestions s LEFT JOIN users u ON u.id=s.user_id WHERE s.id=?", (sid,)
+    ).fetchone()
+    if not r:
+        return None
+    text = (
+        f"✉️ <b>XEM TRƯỚC TRẢ LỜI GÓP Ý #{sid}</b>\n{LINE}\n"
+        f"👤 Gửi riêng cho: <b>{esc(r['name'] or 'Khách')}</b> · <code>{r['user_id']}</code>\n{LINE}\n"
+        f"{sg_reply_message(r['text'], reply)}\n{LINE}\n"
+        f"<i>Chỉ khách này nhận được tin nhắn. Xác nhận gửi?</i>"
+    )
+    kb = K(
+        [
+            [B("✅ Gửi cho khách", callback_data=f"adm:mrs:{sid}:{flt}:{page}")],
+            [B("✏️ Soạn lại", callback_data=f"adm:mr:{sid}:{flt}:{page}"), B("❌ Hủy", callback_data=f"adm:mv:{sid}:{flt}:{page}")],
+        ]
+    )
+    return text, kb
+
+
 async def mail_route(q, ctx, data, uid):
-    """adm:mail[:flt:page] · adm:mv:<id>[:flt:page] (mở + đánh dấu đã đọc) · adm:md:<id>[:flt:page] (xóa) · adm:mra (đọc hết)."""
+    """adm:mail[:flt:page] · adm:mv:<id>[:flt:page] (mở + đánh dấu đã đọc) · adm:md:<id>[:flt:page] (xóa) · adm:mra (đọc hết)
+    · adm:mr:<id>[:flt:page] (soạn trả lời) · adm:mrs:<id>[:flt:page] (xác nhận gửi — chỉ gửi cho khách đã góp ý)."""
     p = data.split(":")
 
     def flt_page(i):
@@ -3873,6 +3993,43 @@ async def mail_route(q, ctx, data, uid):
         n = db.execute("DELETE FROM suggestions WHERE id=?", (sid,)).rowcount
         await show(q, ctx, *mail_list_screen(flt, page))
         return f"~🗑 Đã xóa góp ý #{sid}." if n else "Góp ý này đã bị xóa trước đó."
+    if p[1] == "mr":  # bấm ✉️ Trả lời -> nhập nội dung
+        if not db.execute("SELECT 1 FROM suggestions WHERE id=?", (sid,)).fetchone():
+            await show(q, ctx, *mail_list_screen(flt, page))
+            return "Góp ý này không còn trong hòm thư."
+        ctx.user_data.pop("sg_draft", None)
+        await start_prompt(q, ctx, "sg_reply", f"adm:mv:{sid}:{flt}:{page}", sid=sid, flt=flt, page=page)
+        return
+    if p[1] == "mrs":  # xác nhận -> gửi riêng cho ĐÚNG khách đã góp ý (user_id lấy từ chính góp ý đó)
+        d = ctx.user_data.pop("sg_draft", None)
+        r = db.execute("SELECT * FROM suggestions WHERE id=?", (sid,)).fetchone()
+        if not r:
+            await show(q, ctx, *mail_list_screen(flt, page))
+            return "Góp ý này không còn trong hòm thư."
+        if not d or d.get("sid") != sid:
+            await show(q, ctx, *mail_view_screen(sid, flt, page))
+            return "Nội dung đã hết hạn, hãy bấm Trả lời để soạn lại."
+        try:
+            await ctx.bot.send_message(
+                r["user_id"],
+                sg_reply_message(r["text"], d["text"]),
+                reply_markup=K([[B("📮 Góp ý thêm", callback_data="sg"), B("🏠 Trang chủ", callback_data="home")]]),
+            )
+        except Forbidden:  # khách đã chặn bot
+            db.execute("UPDATE users SET blocked=1 WHERE id=?", (r["user_id"],))
+            await show(q, ctx, *mail_view_screen(sid, flt, page))
+            return "⚠️ Khách đã chặn bot nên không gửi được tin trả lời."
+        except TelegramError as e:
+            ctx.user_data["sg_draft"] = d  # giữ nội dung để admin bấm Xác nhận thử lại
+            log.warning("Gửi trả lời góp ý #%s cho khách %s lỗi: %s", sid, r["user_id"], e)
+            return "⚠️ Gửi thất bại, bạn bấm Gửi cho khách lần nữa để thử lại."
+        now = int(time.time())
+        db.execute(
+            "UPDATE suggestions SET reply=?, replied_by=?, replied_at=?, read_at=COALESCE(read_at,?), read_by=COALESCE(read_by,?) WHERE id=?",
+            (d["text"], uid, now, now, uid, sid),
+        )
+        await show(q, ctx, *mail_view_screen(sid, flt, page))
+        return "~✅ Đã gửi trả lời riêng cho khách."
     db.execute("UPDATE suggestions SET read_at=?, read_by=? WHERE id=? AND read_at IS NULL", (int(time.time()), uid, sid))
     scr = mail_view_screen(sid, flt, page)
     if not scr:
@@ -4120,7 +4277,7 @@ async def admin_route(q, ctx, data, uid):
     if data == "adm:help":
         await show(q, ctx, admin_help(uid), back)
         return
-    if data.startswith(("adm:mail", "adm:mv:", "adm:md:", "adm:mra", "adm:cm")):  # hòm thư góp ý + quản lý khách: CHỈ admin chính
+    if data.startswith(("adm:mail", "adm:mv:", "adm:md:", "adm:mra", "adm:mr:", "adm:mrs:", "adm:cm")):  # hòm thư góp ý + quản lý khách: CHỈ admin chính
         if not is_main(uid):
             return "⛔ Mục này chỉ dành cho admin chính."
         if data.startswith("adm:cm"):
@@ -4180,7 +4337,8 @@ def admin_help(uid):
             "<code>/gifcode keypct 20 [lượt] [MÃ]</code>\n   giảm 20% giá key\n"
             "<code>/gifcode keyflat 5000 [lượt] [MÃ]</code>\n   giảm 5.000đ giá key\n"
             "<code>/gifcode money 50000 [lượt] [MÃ]</code>\n   tặng tiền vào số dư\n"
-            "<code>/gifcode key lc79 30d [lượt] [MÃ]</code>\n   tặng 1 key (game · gói: 1d 3d 7d 30d 60d 90d) — key do sunviw sinh"
+            "<code>/gifcode key lc79 30d [lượt] [MÃ]</code>\n   tặng 1 key (game · gói: 1d 3d 7d 30d 60d 90d) — key do sunviw sinh\n"
+            "<i>Thêm <code>box</code> ở CUỐI lệnh để đăng gifcode lên box, vd: <code>/gifcode money 50000 10 box</code></i>"
         )
     out.append("<code>/game</code> | <code>/stock</code>  xem trạng thái từng game (online / OFF bàn nào) &amp; giá gói")
     if "promo" in perms:
@@ -4196,7 +4354,7 @@ def admin_help(uid):
     if perms & {"deposit", "feedback"}:
         out.append("<code>/pending</code>  xem đơn nạp &amp; feedback đang chờ duyệt")
     if is_main(uid):
-        out.append("👥 <b>Quản lý khách</b> · 📮 <b>Hòm thư góp ý</b>: <code>/admin</code> → nút tương ứng (chỉ admin chính thấy)")
+        out.append("👥 <b>Quản lý khách</b> · 📮 <b>Hòm thư góp ý</b> (đọc &amp; ✉️ trả lời riêng từng khách): <code>/admin</code> → nút tương ứng (chỉ admin chính thấy)")
     if "broadcast" in perms:
         out.append("<code>/broadcast Nội dung</code>  gửi thông báo tới TẤT CẢ khách (có xem trước + xác nhận)")
     out.append("<code>/id</code>  xem ID của bạn / ID của chat (gõ trong box để lấy ID box)")
@@ -4241,7 +4399,10 @@ async def cmd_admin(update, ctx):
 
 async def cmd_gifcode(update, ctx):
     uid = update.effective_user.id
-    a = ctx.args
+    a = list(ctx.args or [])
+    to_box = bool(a) and a[-1].lower() == "box"  # từ khóa "box" ở cuối lệnh = đăng gifcode lên box (mã gifcode tối thiểu 4 ký tự nên không trùng)
+    if to_box:
+        a = a[:-1]
     try:
         kind = GIFT_KINDS[a[0].lower()]
         game = pkg = None
@@ -4269,9 +4430,14 @@ async def cmd_gifcode(update, ctx):
     if not g:
         await update.message.reply_text("❌ Mã này đã tồn tại, chọn mã khác.")
         return
+    if to_box:
+        posted = await post_box(ctx.bot, gift_box_text(g, await bot_username(ctx.bot)))
+        note = "\n📢 Đã đăng gifcode lên box." if posted else "\n⚠️ Chưa đăng được lên box (chưa cấu hình FEEDBACK_CHAT_ID / NOTIFY_CHAT_ID, hoặc bot chưa có quyền gửi tin)."
+    else:
+        note = "\n🔒 Không đăng lên box (thêm <code>box</code> cuối lệnh nếu muốn đăng)."
     await update.message.reply_text(
         f"🎁 <b>ĐÃ TẠO GIFCODE</b>\n{LINE}\nMã: <code>{esc(code)}</code>\n"
-        f"Phần thưởng: {gift_reward_text(g)}\nSố lượng nhập: <b>{uses}</b> lượt"
+        f"Phần thưởng: {gift_reward_text(g)}\nSố lượng nhập: <b>{uses}</b> lượt{note}"
     )
 
 
