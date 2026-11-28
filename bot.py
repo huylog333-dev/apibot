@@ -1135,8 +1135,18 @@ def build_prompts():
             ),
             "bc": (
                 f"📢 <b>THÔNG BÁO TOÀN BOT</b>\n{LINE}\n"
-                f"Gõ nội dung thông báo rồi gửi vào đây (chữ thuần, tối đa {BC_MAX} ký tự). "
+                f"✍️ Gõ nội dung thông báo rồi gửi vào đây (chữ thuần, tối đa {BC_MAX} ký tự).\n"
+                f"📸 Muốn <b>kèm ảnh</b>: gửi tối đa <b>{FB_PHOTOS_MAX} ảnh</b> (chọn nhiều ảnh cùng lúc hoặc gửi từng ảnh; "
+                f"ảnh thường hay <b>file</b> .jpg/.png đều được). Viết nội dung ở phần <b>chú thích</b> của ảnh, "
+                f"hoặc gửi ảnh xong rồi gõ nội dung.\n\n"
                 f"Bot sẽ cho bạn xem trước và xin xác nhận trước khi gửi tới <b>tất cả khách</b>."
+            ),
+            "bc_text": (
+                f"📢 <b>THÔNG BÁO TOÀN BOT</b>\n{LINE}\n"
+                f"✅ Đã nhận <b>{{n}}</b> ảnh (tối đa {FB_PHOTOS_MAX}).\n"
+                f"📸 Muốn thêm ảnh thì cứ gửi tiếp.\n"
+                f"✍️ Xong thì gõ <b>nội dung thông báo</b> rồi gửi vào đây (tối đa {BC_MAX} ký tự), "
+                f"hoặc bấm <b>Gửi chỉ ảnh</b> nếu không cần chữ."
             ),
         }
     )
@@ -1144,7 +1154,7 @@ def build_prompts():
 
 BC_MAX = 3500  # độ dài tối đa 1 thông báo (khớp giới hạn của sunviw)
 build_prompts()
-PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "sg_reply": "adm:mail", "bc": "adm", "cm_find": "adm:cm", "cm_add": "adm:cm", "cm_sub": "adm:cm"}
+PROMPT_BACK = {"amount": "dep", "gift": "dep", "fb_photo": "fb", "fb_text": "home", "sg_text": "home", "sg_reply": "adm:mail", "bc": "adm", "bc_text": "adm", "cm_find": "adm:cm", "cm_add": "adm:cm", "cm_sub": "adm:cm"}
 
 # ============================== GỬI / SỬA TIN NHẮN ==============================
 
@@ -2198,7 +2208,7 @@ async def route(q, ctx, data):
     """Trả về chuỗi thông báo (alert) hoặc None."""
     user = get_user(q.from_user)
     uid = user["id"]
-    ctx.user_data.pop("await", None)
+    prev_wait = ctx.user_data.pop("await", None)  # giữ lại để nút "Gửi chỉ ảnh" (bc:np) còn đọc được ảnh đã nhận
     if user["banned"] and not is_admin(uid):  # tài khoản bị admin chính khóa
         return "⛔ Tài khoản của bạn đã bị khóa. Vui lòng liên hệ CSKH."
 
@@ -2424,16 +2434,23 @@ async def route(q, ctx, data):
         if not has_perm(uid, "broadcast"):
             return "⛔ Bạn không có quyền gửi thông báo toàn bot."
         if data == "bc:go":
-            ctx.user_data.pop("bc_draft", None)
+            await bc_drop(ctx)  # bỏ bản nháp cũ + xóa ảnh xem trước (nếu có)
             await start_prompt(q, ctx, "bc")
             return
+        if data == "bc:np":  # gửi thông báo chỉ có ảnh, không kèm chữ
+            if not prev_wait or prev_wait.get("type") != "bc_text" or not prev_wait.get("photos"):
+                await show(q, ctx, *admin_panel(uid))
+                return "Phiên soạn đã hết hạn, hãy soạn lại."
+            await bc_preview(ctx, q.message.chat_id, q.message.message_id, prev_wait["photos"], "")
+            return
         if data == "bc:ok":
-            text = ctx.user_data.pop("bc_draft", None)
-            if not text:
+            d = ctx.user_data.pop("bc_draft", None)
+            if not d:
                 await show(q, ctx, *admin_panel(uid))
                 return "Nội dung đã hết hạn, hãy soạn lại."
+            await bc_del_msgs(ctx.bot, d)  # xóa ảnh xem trước ở chat admin cho gọn
             await show(q, ctx, f"📤 <b>Đang gửi thông báo...</b>\n{LINE}\nBạn có thể làm việc khác, bot sẽ báo khi xong.")
-            bg(run_bot_broadcast(ctx.bot, q.message.chat_id, q.message.message_id, text, q.from_user.full_name))
+            bg(run_bot_broadcast(ctx.bot, q.message.chat_id, q.message.message_id, d["text"], q.from_user.full_name, d["photos"]))
             return
 
     # ---------- Feedback: admin duyệt / từ chối ----------
@@ -2537,22 +2554,19 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await wiz_text(ctx, st, text)
         return
     back = st.get("back") or PROMPT_BACK[st["type"]]
-    kb_back = K([[B("⬅️ Quay lại", callback_data=back)]])
+    kb_back = bc_text_kb() if st["type"] == "bc_text" else K([[B("⬅️ Quay lại", callback_data=back)]])
 
     async def err(msg):
         await edit_or_send(ctx.bot, chat, mid, f"{prompt_of(st)}\n\n{msg}", kb_back)
 
-    if st["type"] == "bc":  # admin (quyền broadcast) soạn thông báo toàn bot -> xem trước -> xác nhận
+    if st["type"] in ("bc", "bc_text"):  # admin (quyền broadcast) soạn thông báo toàn bot (chữ, có thể kèm ảnh) -> xem trước -> xác nhận
         if not has_perm(uid, "broadcast"):
             return
         if not text:
             return await err("⚠️ Hãy gõ nội dung thông báo bằng chữ.")
         if len(text) > BC_MAX:
             return await err(f"⚠️ Quá dài ({len(text)}/{BC_MAX} ký tự). Hãy rút gọn.")
-        ctx.user_data.pop("await", None)
-        ctx.user_data["bc_draft"] = text
-        t, kb = bc_confirm(text)
-        await edit_or_send(ctx.bot, chat, mid, t, kb)
+        await bc_preview(ctx, chat, mid, st.get("photos") or [], text)
         return
 
     if st["type"] == "sg_reply":  # admin chính soạn trả lời 1 góp ý -> xem trước -> xác nhận (chỉ gửi cho đúng khách đó)
@@ -2814,10 +2828,13 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     doc = m.document
     caption = (m.caption or "").strip()
     await safe_delete(m)  # file_id vẫn dùng được sau khi xóa tin gốc
-    if not st or st["type"] not in ("fb_photo", "fb_text"):
+    if not st or st["type"] not in ("fb_photo", "fb_text", "bc", "bc_text"):
         return
     user = get_user(m.from_user)
     if user["banned"] and not is_admin(user["id"]):
+        return
+    is_bc = st["type"] in ("bc", "bc_text")  # ảnh đính kèm thông báo toàn bot (admin có quyền broadcast)
+    if is_bc and not has_perm(user["id"], "broadcast"):
         return
     chat, mid = st["chat"], st["msg"]
     if doc:
@@ -2842,7 +2859,28 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if caption and not st.get("caption"):
         st["caption"] = caption
     st["flush"] = st.get("flush", 0) + 1
-    bg(fb_photos_ready(ctx, user, st, st["flush"]))
+    bg((bc_photos_ready if is_bc else fb_photos_ready)(ctx, user, st, st["flush"]))
+
+
+async def bc_photos_ready(ctx, user, st, gen):
+    """Như fb_photos_ready nhưng cho thông báo toàn bot: có chú thích thì sang xem trước, chưa có thì xin nội dung
+    (hoặc admin bấm 'Gửi chỉ ảnh')."""
+    await asyncio.sleep(FB_ALBUM_WAIT)
+    if ctx.user_data.get("await") is not st or st.get("flush") != gen:
+        return  # có ảnh mới hơn đang chờ gom, hoặc admin đã thoát / đổi bước
+    chat, mid = st["chat"], st["msg"]
+    photos = st.get("photos") or []
+    if not photos:
+        return
+    try:
+        if st.get("caption"):
+            await bc_preview(ctx, chat, mid, photos, st["caption"])
+        else:
+            st["type"] = "bc_text"
+            warn = f"\n\n⚠️ Tối đa {FB_PHOTOS_MAX} ảnh, các ảnh dư đã bị bỏ qua." if st.pop("over", False) else ""
+            await edit_or_send(ctx.bot, chat, mid, prompt_of(st) + warn, bc_text_kb())
+    except Exception:
+        log.exception("Lỗi xử lý ảnh thông báo toàn bot")
 
 
 async def fb_photos_ready(ctx, user, st, gen):
@@ -3123,7 +3161,41 @@ def bc_targets():
 
 
 def bc_message(text):
-    return f"📢 <b>THÔNG BÁO</b>\n{LINE}\n{esc(text)}"
+    head = "📢 <b>THÔNG BÁO</b>"
+    return f"{head}\n{LINE}\n{esc(text)}" if text else head  # thông báo chỉ có ảnh: chỉ còn tiêu đề
+
+
+BC_CAP = 1024  # Telegram giới hạn chú thích ảnh 1024 ký tự; dài hơn thì gửi ảnh trước, chữ thành tin riêng ngay sau
+
+
+def bc_text_kb():
+    """Nút ở bước 'đã nhận ảnh, chờ nội dung' của thông báo toàn bot."""
+    return K([[B("📤 Gửi chỉ ảnh (không kèm chữ)", callback_data="bc:np")], [B("❌ Hủy", callback_data="adm")]])
+
+
+async def bc_send(bot, chat_id, text, photos=None, kb=None):
+    """Gửi 1 thông báo tới 1 chat -> danh sách Message đã gửi. photos = list file_id (str) hoặc bytes (tối đa FB_PHOTOS_MAX).
+    · Không ảnh : 1 tin chữ + nút.
+    · 1 ảnh     : ảnh kèm chú thích (chữ) + nút.
+    · Nhiều ảnh : album, chữ nằm ở chú thích ảnh đầu (album Telegram không gắn được nút).
+    · Chữ dài hơn BC_CAP: ảnh gửi trước, chữ + nút thành tin riêng ngay sau."""
+    msg = bc_message(text)
+    photos = list(photos or [])[:FB_PHOTOS_MAX]
+    if not photos:
+        return [await bot.send_message(chat_id, msg, reply_markup=kb)]
+    caption = msg if len(msg) <= BC_CAP else None
+    sent = []
+    if len(photos) == 1:
+        sent.append(await bot.send_photo(chat_id, photos[0], caption=caption, reply_markup=kb if caption else None))
+    else:
+        media = [
+            InputMediaPhoto(p, caption=caption, parse_mode=ParseMode.HTML) if (i == 0 and caption) else InputMediaPhoto(p)
+            for i, p in enumerate(photos)
+        ]
+        sent += list(await bot.send_media_group(chat_id, media))
+    if caption is None:
+        sent.append(await bot.send_message(chat_id, msg, reply_markup=kb))
+    return sent
 
 
 def _retry_secs(e):
@@ -3131,32 +3203,40 @@ def _retry_secs(e):
     return float(ra.total_seconds() if hasattr(ra, "total_seconds") else ra)
 
 
-async def do_broadcast(bot, text, progress=None):
-    """Gửi lần lượt (≈20 tin/giây, tôn trọng giới hạn Telegram). Khách đã chặn bot bị đánh dấu & bỏ qua lần sau. -> (đã gửi, lỗi, tổng)."""
+async def do_broadcast(bot, text, progress=None, photos=None):
+    """Gửi lần lượt (≈20 tin/giây, tôn trọng giới hạn Telegram; mỗi ảnh tính là 1 tin nên thông báo nhiều ảnh gửi chậm lại tương ứng).
+    Khách đã chặn bot bị đánh dấu & bỏ qua lần sau. photos = list file_id ảnh đính kèm (tùy chọn). -> (đã gửi, lỗi, tổng)."""
     global _bc_lock
     if _bc_lock is None:
         _bc_lock = asyncio.Lock()
     async with _bc_lock:
         ids = bc_targets()
-        msg, kb = bc_message(text), K([[B("🏠 Vào Bot", callback_data="home")]])
+        kb = K([[B("🏠 Vào Bot", callback_data="home")]])
+        photos = list(photos or [])
         sent = failed = 0
+        warned = False
         for i, uid in enumerate(ids):
-            for attempt in (1, 2):
+            cost = 1  # số tin Telegram đã gửi cho khách này (để giãn nhịp)
+            for attempt in (1, 2, 3):
                 try:
-                    await bot.send_message(uid, msg, reply_markup=kb)
+                    out = await bc_send(bot, uid, text, photos, kb)
+                    cost = max(1, len(out))
                     sent += 1
                 except RetryAfter as e:
-                    if attempt == 1:
+                    if attempt < 3:
                         await asyncio.sleep(_retry_secs(e) + 1)
                         continue
                     failed += 1
                 except Forbidden:
                     failed += 1
                     db.execute("UPDATE users SET blocked=1 WHERE id=?", (uid,))
-                except TelegramError:
+                except TelegramError as e:
                     failed += 1
+                    if not warned:  # ghi log lần đầu để biết vì sao lỗi (vd ảnh hỏng) mà không spam log
+                        warned = True
+                        log.warning("Broadcast: gửi cho khách %s lỗi: %s", uid, e)
                 break
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.05 * cost)
             if progress and (i + 1) % 40 == 0:
                 await progress(i + 1, len(ids))
         return sent, failed, len(ids)
@@ -3189,23 +3269,30 @@ async def panel_broadcast(app, it):
             pass
 
 
-async def run_bot_broadcast(bot, chat, mid, text, by_name):
-    """Thông báo admin soạn NGAY TRONG BOT (nút 📢 hoặc /broadcast)."""
+async def run_bot_broadcast(bot, chat, mid, text, by_name, photos=None):
+    """Thông báo admin soạn NGAY TRONG BOT (nút 📢 hoặc /broadcast), có thể kèm ảnh."""
+    photos = list(photos or [])
 
     async def progress(done, total):
         await edit_or_send(bot, chat, mid, f"📤 <b>Đang gửi...</b> {done}/{total}", None)
 
-    sent, failed, total = await do_broadcast(bot, text, progress)
+    sent, failed, total = await do_broadcast(bot, text, progress, photos)
     await edit_or_send(
         bot, chat, mid,
-        f"✅ <b>ĐÃ GỬI THÔNG BÁO</b>\n{LINE}\n👥 Tổng khách: <b>{total}</b>\n📨 Gửi được: <b>{sent}</b>\n"
-        f"⚠️ Lỗi / đã chặn bot: <b>{failed}</b>",
+        f"✅ <b>ĐÃ GỬI THÔNG BÁO</b>\n{LINE}\n👥 Tổng khách: <b>{total}</b>\n"
+        + (f"🖼 Kèm ảnh: <b>{len(photos)}</b>\n" if photos else "")
+        + f"📨 Gửi được: <b>{sent}</b>\n⚠️ Lỗi / đã chặn bot: <b>{failed}</b>",
         K([[B("🛠 Bảng admin", callback_data="adm")]]),
     )
-    await report_broadcast("bc_log", {"text": text, "sent": sent, "failed": failed, "by": by_name})
+    log_text = text or "(chỉ có ảnh)"
+    if photos:  # lịch sử ở panel sunviw chỉ lưu chữ -> ghi chú số ảnh (vẫn trong giới hạn BC_MAX của sunviw)
+        suffix = f" [+{len(photos)} ảnh]"
+        log_text = log_text[: BC_MAX - len(suffix)] + suffix
+    await report_broadcast("bc_log", {"text": log_text, "sent": sent, "failed": failed, "by": by_name})
 
 
-def bc_confirm(text):
+def bc_confirm(d):
+    """Tin điều khiển ở bước xem trước. d = bản nháp {"text", "photos", ...}. Có ảnh thì tin xem trước (ảnh + chữ) nằm ngay phía trên."""
     n = len(bc_targets())
     kb = K(
         [
@@ -3213,7 +3300,65 @@ def bc_confirm(text):
             [B("✏️ Soạn lại", callback_data="bc:go"), B("❌ Hủy", callback_data="adm")],
         ]
     )
-    return f"📢 <b>XEM TRƯỚC THÔNG BÁO</b>\n{LINE}\n{bc_message(text)}\n{LINE}\nSẽ gửi tới <b>{n}</b> khách. Xác nhận?", kb
+    if d.get("photos"):
+        what = f"<b>{len(d['photos'])}</b> ảnh" + (" + chữ" if d.get("text") else " (không kèm chữ)")
+        body = f"⬆️ Phía trên là tin khách sẽ nhận: {what}."
+    else:
+        body = bc_message(d["text"])
+    return f"📢 <b>XEM TRƯỚC THÔNG BÁO</b>\n{LINE}\n{body}\n{LINE}\nSẽ gửi tới <b>{n}</b> khách. Xác nhận?", kb
+
+
+async def bc_del_msgs(bot, d):
+    """Xóa các tin xem trước (ảnh) của bản nháp ở chat admin."""
+    if d and d.get("msgs"):
+        await asyncio.gather(*(delete_by_id(bot, d["chat"], m) for m in d["msgs"]))
+
+
+async def bc_drop(ctx):
+    """Bỏ bản nháp thông báo + dọn tin xem trước (nếu có)."""
+    await bc_del_msgs(ctx.bot, ctx.user_data.pop("bc_draft", None))
+
+
+async def bc_preview(ctx, chat, prompt_mid, photos, text):
+    """Bước xem trước thông báo. Chỉ chữ: sửa tin nhắc nhập thành màn xác nhận. Có ảnh: gửi cho admin ĐÚNG tin khách sẽ nhận
+    (ảnh + chữ), kèm 1 tin điều khiển Gửi / Soạn lại / Hủy ngay dưới. photos = [{"id": file_id, "doc": True/False}, ...];
+    ảnh gửi dạng file được tải về rồi gửi lại thành ảnh thường, từ đây chỉ lưu file_id ảnh để dùng khi phát cho khách."""
+    ctx.user_data.pop("await", None)
+    await bc_drop(ctx)
+    text = (text or "").strip()
+    photos = (photos or [])[:FB_PHOTOS_MAX]
+    if not photos:  # chỉ chữ (như trước đây)
+        d = {"text": text, "photos": [], "msgs": [], "chat": chat}
+        ctx.user_data["bc_draft"] = d
+        t, kb = bc_confirm(d)
+        await edit_or_send(ctx.bot, chat, prompt_mid, t, kb)
+        return
+    await delete_by_id(ctx.bot, chat, prompt_mid)
+    sent = []
+    try:
+        media = []
+        for ph in photos:
+            if ph.get("doc"):
+                f = await ctx.bot.get_file(ph["id"])
+                media.append(bytes(await f.download_as_bytearray()))
+            else:
+                media.append(ph["id"])
+        sent = await bc_send(ctx.bot, chat, text, media, None)
+        ids = [m.photo[-1].file_id for m in sent if getattr(m, "photo", None)]
+        if len(ids) != len(media):
+            raise TelegramError("số ảnh gửi xem trước không khớp")
+    except TelegramError as e:
+        log.warning("Không dựng được bản xem trước thông báo (ảnh): %s", e)
+        for m in sent:
+            await delete_by_id(ctx.bot, chat, m.message_id)
+        await ctx.bot.send_message(
+            chat, "⚠️ Không xử lý được ảnh, vui lòng thử gửi lại.", reply_markup=K([[B("⬅️ Bảng admin", callback_data="adm")]])
+        )
+        return
+    d = {"text": text, "photos": ids, "msgs": [m.message_id for m in sent], "chat": chat}
+    ctx.user_data["bc_draft"] = d
+    t, kb = bc_confirm(d)
+    await ctx.bot.send_message(chat, t, reply_markup=kb)
 
 
 # ============================== NHẮC KEY SẮP HẾT HẠN ==============================
@@ -4262,7 +4407,7 @@ async def admin_route(q, ctx, data, uid):
     chat = q.message.chat_id
     if data == "adm":
         ctx.user_data.pop("wiz", None)
-        ctx.user_data.pop("bc_draft", None)
+        await bc_drop(ctx)  # hủy thông báo đang soạn + xóa ảnh xem trước (nếu có)
         await show(q, ctx, *admin_panel(uid))
         return
     back = K([[B("⬅️ Bảng admin", callback_data="adm")]])
@@ -4356,7 +4501,10 @@ def admin_help(uid):
     if is_main(uid):
         out.append("👥 <b>Quản lý khách</b> · 📮 <b>Hòm thư góp ý</b> (đọc &amp; ✉️ trả lời riêng từng khách): <code>/admin</code> → nút tương ứng (chỉ admin chính thấy)")
     if "broadcast" in perms:
-        out.append("<code>/broadcast Nội dung</code>  gửi thông báo tới TẤT CẢ khách (có xem trước + xác nhận)")
+        out.append(
+            "<code>/broadcast Nội dung</code>  gửi thông báo tới TẤT CẢ khách (có xem trước + xác nhận)\n"
+            f"   📸 Muốn kèm ảnh (tối đa {FB_PHOTOS_MAX}): bấm nút <b>Thông Báo Toàn Bot</b> hoặc gõ <code>/broadcast</code> rồi gửi ảnh"
+        )
     out.append("<code>/id</code>  xem ID của bạn / ID của chat (gõ trong box để lấy ID box)")
     out.append(
         f"{LINE}\n<i>Game, giá gói, link game, CSKH, box... chỉnh ở <b>panel sunviw → tab Bot Tele</b>. "
@@ -4508,15 +4656,17 @@ async def cmd_broadcast(update, ctx):
     uid = update.effective_user.id
     text = (update.message.text or "").partition(" ")[2].strip()
     if not text:
-        ctx.user_data.pop("bc_draft", None)
+        await bc_drop(ctx)
         msg = await update.message.reply_text(PROMPTS["bc"], reply_markup=K([[B("⬅️ Quay lại", callback_data="adm")]]))
         ctx.user_data["await"] = {"type": "bc", "chat": msg.chat_id, "msg": msg.message_id, "back": None}
         return
     if len(text) > BC_MAX:
         await update.message.reply_text(f"⚠️ Quá dài ({len(text)}/{BC_MAX} ký tự). Hãy rút gọn.")
         return
-    ctx.user_data["bc_draft"] = text
-    t, kb = bc_confirm(text)
+    await bc_drop(ctx)
+    d = {"text": text, "photos": [], "msgs": [], "chat": update.effective_chat.id}
+    ctx.user_data["bc_draft"] = d
+    t, kb = bc_confirm(d)
     await update.message.reply_text(t, reply_markup=kb)
 
 
